@@ -129,7 +129,25 @@ npm install          # 安裝依賴
 npm run dev          # 本機開發
 npm run build        # 建置
 npm run bundle:sql   # 重新產生 supabase/setup.sql（合併 migrations）
+npm run deploy:gh    # 部署到 GitHub Pages（自動設定子路徑 base）
+npm run deploy:cf    # 部署到 Cloudflare Pages（需 CLOUDFLARE_API_TOKEN）
 ```
+
+## 已部署的站台（同一個 Supabase 資料庫）
+
+| 平台 | 網址 |
+|---|---|
+| Netlify | https://fsjh-grade-query.netlify.app |
+| GitHub Pages | https://shrjie.github.io/score_supabase/ |
+| Cloudflare Pages | https://score-query-2ju.pages.dev |
+
+三個站台共用同一份資料庫，資料一致；修改後可挑一個或全部重新部署。
+
+**GitHub Pages**：使用 `gh-pages` 分支（`npm run deploy:gh` 會自動以 `VITE_BASE_PATH=/<repo>/` 建置後推送）。
+**Cloudflare Pages**：需設定環境變數 `CLOUDFLARE_API_TOKEN` 與 `CLOUDFLARE_ACCOUNT_ID` 後執行 `npm run deploy:cf`。
+**Cloudflare 安全標頭**：由 `public/_headers` 提供（CSP 等），Netlify 則由 `netlify.toml` 提供。
+
+> GitHub Pages 無法自訂 HTTP 標頭（沒有 `_headers` 支援），安全標頭僅在 Netlify / Cloudflare 生效。
 
 ---
 

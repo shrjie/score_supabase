@@ -1,0 +1,12 @@
+[build]
+  command = "npm run build"
+  publish = "dist"
+
+[build.environment]
+  NODE_VERSION = "24"
+
+# SPA：所有路徑導回 index.html（目前使用 HashRouter，保險起見仍保留）
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200

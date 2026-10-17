@@ -1,0 +1,2683 @@
+// ============================================================
+// 福山國中成績查詢系統 — Google Apps Script 版（功能對齊 Cloudflare D1 版）
+// 部署：網頁應用程式 / 執行身分：我 / 存取：所有人（含匿名）
+// 資料：全部存在 Google Sheet（本試算表）
+//   - Sheet ID 自動抓取（綁定式指令碼用 ActiveSpreadsheet，另有備援 ID）
+//   - 學生頁：登入→選考試→成績明細＋平均＋全班統計＋歷次走勢＋列印個人成績單
+//   - 老師頁（?page=teacher）：成績編修＋考試科目＋學生管理＋操作紀錄＋系統標題編修
+// D1/ 資料夾內容嚴禁更動，本檔獨立運作。
+// ============================================================
+
+var FALLBACK_SPREADSHEET_ID = '1_miDA9q4I09MDjujwNrWmXqZYJ5MDmkBc90aZMxwwaU';
+var ACCOUNT_SHEET = '學生帳密';
+var CONFIG_SHEET  = '設定';
+var AUDIT_SHEET   = '稽核紀錄';
+var DEFAULT_TITLE = '福山國中1421成績查詢';
+var DEFAULT_TEACHER_PW = 'admin123';
+var DEFAULT_CLASS_NO = '1421';
+var DERIVED_RE = /排名|名次|總分|平均|進退步|前名次/;
+var SEAT_COL_NAMES = ['座號', '號', 'seat', 'no', 'No', 'NO'];
+var NAME_COL_NAMES = ['姓名', '名字', 'name', 'Name', 'NAME'];
+var DERIVED_COLS = ['總分', '平均', '班名次', '前名次', '進退步'];
+
+// ---------------- 基礎：試算表 ----------------
+function getSS() {
+  try {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    if (ss) return ss;
+  } catch (e) { /* 非綁定執行時會拋錯，改用備援 ID */ }
+  return SpreadsheetApp.openById(FALLBACK_SPREADSHEET_ID);
+}
+
+function isReserved(name) {
+  return name === ACCOUNT_SHEET || name === CONFIG_SHEET || name === AUDIT_SHEET;
+}
+
+function listExamNames() {
+  var ss = getSS();
+  return ss.getSheets().map(function (s) { return s.getName(); })
+    .filter(function (n) { return !isReserved(n); });
+}
+function orderedExamNames() { return listExamNames(); }
+
+function nextExamName(name) {
+  var ids = orderedExamNames();
+  var i = ids.indexOf(name);
+  return (i >= 0 && i + 1 < ids.length) ? ids[i + 1] : null;
+}
+
+// ---------------- 設定（含系統標題、老師密碼） ----------------
+function ensureConfigSheet() {
+  var ss = getSS();
+  var sh = ss.getSheetByName(CONFIG_SHEET);
+  if (!sh) {
+    sh = ss.insertSheet(CONFIG_SHEET);
+    sh.getRange(1, 1, 1, 2).setValues([['鍵', '值']]);
+    sh.getRange(2, 1, 3, 2).setValues([
+      ['SYSTEM_TITLE', DEFAULT_TITLE],
+      ['TEACHER_PASSWORD', DEFAULT_TEACHER_PW],
+      ['CLASS_NO', DEFAULT_CLASS_NO]
+    ]);
+  }
+  return sh;
+}
+
+function getConfig(key, defVal) {
+  var sh = ensureConfigSheet();
+  var data = sh.getDataRange().getValues();
+  for (var i = 1; i < data.length; i++) {
+    if (String(data[i][0]).trim() === key) return String(data[i][1]);
+  }
+  return defVal;
+}
+
+function setConfig(key, val) {
+  var sh = ensureConfigSheet();
+  var data = sh.getDataRange().getValues();
+  for (var i = 1; i < data.length; i++) {
+    if (String(data[i][0]).trim() === key) {
+      sh.getRange(i + 1, 2).setValue(val);
+      return;
+    }
+  }
+  sh.appendRow([key, val]);
+}
+
+function getSystemTitle() {
+  var t = getConfig('SYSTEM_TITLE', DEFAULT_TITLE);
+  return t ? t : DEFAULT_TITLE;
+}
+
+function verifyTeacher(pw) {
+  return String(pw || '') === getConfig('TEACHER_PASSWORD', DEFAULT_TEACHER_PW);
+}
+
+// ---------------- 稽核紀錄 ----------------
+function ensureAuditSheet() {
+  var ss = getSS();
+  var sh = ss.getSheetByName(AUDIT_SHEET);
+  if (!sh) {
+    sh = ss.insertSheet(AUDIT_SHEET);
+    sh.getRange(1, 1, 1, 4).setValues([['時間', '老師', '動作', '明細']]);
+  }
+  return sh;
+}
+
+function logAudit(teacher, action, detail) {
+  try {
+    ensureAuditSheet().appendRow([new Date(), teacher || 'teacher', action || '', detail || '']);
+  } catch (e) { /* 稽核寫入失敗不影響主流程 */ }
+}
+
+// ---------------- 帳號 ----------------
+function isTruthy(v) {
+  if (v === true) return true;
+  var s = String(v == null ? '' : v).trim();
+  return s === '1' || s.toUpperCase() === 'TRUE' || s.indexOf('測') >= 0 || s === '🧪';
+}
+
+function normSeat(s) {
+  var t = String(s == null ? '' : s).trim();
+  if (t === '') return '';
+  var n = Number(t);
+  if (!isNaN(n)) return String(n);
+  return t;
+}
+
+// 讀學生帳密表：A帳號 B密碼 C座號 D姓名 E班級(選) F測試(選)
+function readAccounts() {
+  var ss = getSS();
+  var sh = ss.getSheetByName(ACCOUNT_SHEET);
+  if (!sh) throw new Error('找不到「' + ACCOUNT_SHEET + '」工作表');
+  var data = sh.getDataRange().getValues();
+  var width = data.length ? data[0].length : 0;
+  var out = [];
+  for (var i = 1; i < data.length; i++) {
+    var acc = String(data[i][0] == null ? '' : data[i][0]).trim();
+    if (!acc) continue;
+    out.push({
+      account: acc,
+      password: String(data[i][1] == null ? '' : data[i][1]).trim(),
+      seat: String(data[i][2] == null ? '' : data[i][2]).trim(),
+      name: String(data[i][3] == null ? '' : data[i][3]).trim(),
+      classNo: width > 4 ? (String(data[i][4] == null ? '' : data[i][4]).trim() || DEFAULT_CLASS_NO) : DEFAULT_CLASS_NO,
+      excluded: width > 5 ? isTruthy(data[i][5]) : false,
+      row: i + 1
+    });
+  }
+  return out;
+}
+
+function findSeatCol(headers) {
+  for (var j = 0; j < headers.length; j++) {
+    if (SEAT_COL_NAMES.indexOf(headers[j]) >= 0) return j;
+  }
+  return 0;
+}
+function findNameCol(headers) {
+  for (var j = 0; j < headers.length; j++) {
+    if (NAME_COL_NAMES.indexOf(headers[j]) >= 0) return j;
+  }
+  return 1;
+}
+
+// ---------------- 計分引擎（對齊 D1 recalcChain） ----------------
+function parseWeight(name, fallback) {
+  var fb = (fallback == null ? 1 : fallback);
+  var s = String(name || '');
+  var star = s.lastIndexOf('*');
+  if (star < 0) return fb;
+  var w = parseFloat(s.substring(star + 1));
+  return (w > 0) ? w : fb;
+}
+function stripWeightSuffix(name) {
+  var s = String(name || '').trim();
+  var star = s.lastIndexOf('*');
+  if (star > 0) {
+    var tail = s.substring(star + 1).trim();
+    if (tail !== '' && !isNaN(Number(tail))) return s.substring(0, star).trim();
+  }
+  return s;
+}
+function syncWeightSuffix(name, weight) {
+  var base = stripWeightSuffix(name) || String(name || '').trim();
+  var w = (weight === Math.round(weight)) ? String(Math.round(weight)) : String(weight);
+  return base + '*' + w;
+}
+function isPureSubject(h) {
+  return !!h && !DERIVED_RE.test(h);
+}
+function isGradeCol(headers, idx, seatCol, nameCol) {
+  if (idx === seatCol || idx === nameCol) return false;
+  var h = headers[idx];
+  return !!h && !DERIVED_RE.test(h);
+}
+function validScore(v) {
+  if (v === null || v === undefined || v === '') return { ok: true, value: null };
+  var n = Number(v);
+  if (!isFinite(n)) return { ok: false, msg: '成績必須是數字，收到：' + v };
+  if (n < -10000 || n > 10000) return { ok: false, msg: '成績超出範圍：' + v };
+  return { ok: true, value: Math.round(n * 1000000) / 1000000 };
+}
+// Excel RANK.EQ：由高到低，同分並列、下一名跳號
+function compRank(entries) {
+  var sorted = entries.slice().sort(function (a, b) { return b.value - a.value; });
+  var ranks = {};
+  var prev = null, prevRank = 0;
+  for (var i = 0; i < sorted.length; i++) {
+    var r = (sorted[i].value === prev) ? prevRank : (i + 1);
+    ranks[sorted[i].key] = r;
+    prev = sorted[i].value; prevRank = r;
+  }
+  return ranks;
+}
+function toNum(v) {
+  if (v === null || v === undefined || v === '') return null;
+  var n = Number(v);
+  return isFinite(n) ? n : null;
+}
+
+// 確保衍生欄存在（總分/平均/班名次/前名次/進退步），回傳最新 headers
+function ensureDerivedColumns(sh, headers) {
+  var last = headers.length;
+  for (var k = 0; k < DERIVED_COLS.length; k++) {
+    if (headers.indexOf(DERIVED_COLS[k]) < 0) {
+      sh.getRange(1, last + 1).setValue(DERIVED_COLS[k]);
+      headers.push(DERIVED_COLS[k]);
+      last++;
+    }
+  }
+  return headers;
+}
+
+// 重算單次考試；prevClass：{normSeat: 上次班名次}
+// 回傳 {cells, classRanks}
+function recalcOneExam(sheetName, prevClass) {
+  var ss = getSS();
+  var sh = ss.getSheetByName(sheetName);
+  if (!sh) throw new Error('找不到工作表：' + sheetName);
+  var data = sh.getDataRange().getValues();
+  if (data.length < 2) return { cells: 0, classRanks: {} };
+  var headers = data[0].map(function (h) { return String(h == null ? '' : h).trim(); });
+  headers = ensureDerivedColumns(sh, headers);
+  var W = headers.length;
+  var seatCol = findSeatCol(headers);
+  var nameCol = findNameCol(headers);
+
+  var accounts = readAccounts();
+  var exclMap = {};
+  accounts.forEach(function (a) { if (a.excluded) exclMap[normSeat(a.seat)] = true; });
+
+  var pureCols = [];
+  for (var c = 0; c < headers.length; c++) {
+    if (isGradeCol(headers, c, seatCol, nameCol)) pureCols.push(c);
+  }
+  var weights = {};
+  pureCols.forEach(function (c) { weights[c] = parseWeight(headers[c], 1); });
+
+  // 科排名欄 ↔ 純科目配對（國排名→國文*5，依首字）
+  var rankPairs = [];
+  for (var r2 = 0; r2 < headers.length; r2++) {
+    var h = headers[r2];
+    if (!/排名|名次/.test(h)) continue;
+    if (h === '班名次' || h === '前名次') continue;
+    var base = h.replace(/排名|名次/g, '');
+    for (var p = 0; p < pureCols.length; p++) {
+      if (stripWeightSuffix(headers[pureCols[p]]).indexOf(base) === 0) {
+        rankPairs.push({ rank: r2, subj: pureCols[p] });
+        break;
+      }
+    }
+  }
+  var colTotal = headers.indexOf('總分');
+  var colAvg = -1, colClass = headers.indexOf('班名次'),
+      colPrev = headers.indexOf('前名次'), colProg = headers.indexOf('進退步');
+  for (var a2 = 0; a2 < headers.length; a2++) {
+    if (headers[a2].indexOf('平均') >= 0) { colAvg = a2; break; }
+  }
+
+  // 補齊列寬
+  for (var i = 1; i < data.length; i++) {
+    while (data[i].length < W) data[i].push('');
+  }
+  var seatKey = function (rowIdx) { return normSeat(data[rowIdx][seatCol]); };
+
+  // 總分 / 平均
+  var totals = {};
+  for (var r3 = 1; r3 < data.length; r3++) {
+    var t = 0, w = 0, has = false;
+    for (var q = 0; q < pureCols.length; q++) {
+      var v = toNum(data[r3][pureCols[q]]);
+      if (v !== null) { t += v * weights[pureCols[q]]; w += weights[pureCols[q]]; has = true; }
+    }
+    var tv = has ? Math.round(t * 10000) / 10000 : null;
+    totals[seatKey(r3)] = tv;
+    if (colTotal >= 0) data[r3][colTotal] = tv;
+    if (colAvg >= 0) data[r3][colAvg] = (has && w) ? Math.round((t / w) * 100000000) / 100000000 : null;
+  }
+  // 科排名（測試帳不列入，留白）
+  rankPairs.forEach(function (rp) {
+    var entries = [];
+    for (var r4 = 1; r4 < data.length; r4++) {
+      var k = seatKey(r4);
+      if (!String(data[r4][seatCol]).trim()) continue;
+      if (exclMap[k]) continue;
+      var v = toNum(data[r4][rp.subj]);
+      if (v !== null) entries.push({ key: k + '_' + r4, value: v });
+    }
+    var ranks = compRank(entries);
+    for (var r5 = 1; r5 < data.length; r5++) {
+      var kk = seatKey(r5);
+      var val = null;
+      if (!exclMap[kk] && String(data[r5][seatCol]).trim()) {
+        var hit = ranks[kk + '_' + r5];
+        val = (hit == null ? null : hit);
+      }
+      data[r5][rp.rank] = val;
+    }
+  });
+  // 班名次（測試帳不列入）
+  var classEntries = [];
+  for (var r6 = 1; r6 < data.length; r6++) {
+    var k6 = seatKey(r6);
+    if (!String(data[r6][seatCol]).trim()) continue;
+    if (exclMap[k6]) continue;
+    var tv6 = totals[k6];
+    if (tv6 !== null && tv6 !== undefined) classEntries.push({ key: k6 + '_' + r6, value: tv6 });
+  }
+  var classRanksArr = compRank(classEntries);
+  var classRanks = {};
+  for (var r7 = 1; r7 < data.length; r7++) {
+    var k7 = seatKey(r7);
+    var cv = null;
+    if (!exclMap[k7] && String(data[r7][seatCol]).trim()) {
+      var h7 = classRanksArr[k7 + '_' + r7];
+      cv = (h7 == null ? null : h7);
+      if (cv !== null) classRanks[k7] = cv;
+    }
+    if (colClass >= 0) data[r7][colClass] = cv;
+  }
+  // 前名次 / 進退步
+  for (var r8 = 1; r8 < data.length; r8++) {
+    var k8 = seatKey(r8);
+    var prev = (prevClass && prevClass[k8] != null) ? prevClass[k8] : null;
+    var cur = (classRanks[k8] != null) ? classRanks[k8] : null;
+    if (colPrev >= 0) data[r8][colPrev] = prev;
+    if (colProg >= 0) data[r8][colProg] = (prev !== null && cur !== null) ? prev - cur : null;
+  }
+  // 寫回（只寫衍生欄）
+  var derived = [];
+  if (colTotal >= 0) derived.push(colTotal);
+  if (colAvg >= 0) derived.push(colAvg);
+  if (colClass >= 0) derived.push(colClass);
+  if (colPrev >= 0) derived.push(colPrev);
+  if (colProg >= 0) derived.push(colProg);
+  rankPairs.forEach(function (rp) { derived.push(rp.rank); });
+  derived.forEach(function (c) {
+    var col = [];
+    for (var r9 = 1; r9 < data.length; r9++) {
+      var v9 = data[r9][c];
+      col.push([v9 === null ? '' : v9]);
+    }
+    sh.getRange(2, c + 1, data.length - 1, 1).setValues(col);
+  });
+  return { cells: derived.length * (data.length - 1), classRanks: classRanks };
+}
+
+function recalcChain(names, seedPrev) {
+  var list = names || orderedExamNames();
+  var prev = seedPrev || {};
+  var cells = 0;
+  list.forEach(function (n) {
+    var r = recalcOneExam(n, prev);
+    prev = r.classRanks;
+    cells += r.cells;
+  });
+  return { exams: list.length, cells: cells };
+}
+
+// 讀取某次考試已存的班名次 {normSeat: rank}（部分重算的種子，不寫回該表）
+function readClassRanks(sheetName) {
+  var out = {};
+  try {
+    var sh = getSS().getSheetByName(String(sheetName).trim());
+    if (!sh) return out;
+    var data = sh.getDataRange().getValues();
+    if (data.length < 2) return out;
+    var headers = data[0].map(function (x) { return String(x == null ? '' : x).trim(); });
+    var ci = headers.indexOf('班名次');
+    if (ci < 0) return out;
+    var seatCol = findSeatCol(headers);
+    for (var i = 1; i < data.length; i++) {
+      var k = normSeat(data[i][seatCol]);
+      var v = toNum(data[i][ci]);
+      if (k && v !== null) out[k] = v;
+    }
+  } catch (e) { /* 讀不到就當無種子 */ }
+  return out;
+}
+
+// 單次異動重算窗口：[前一次, 本次, 下一次]，並以前前次班名次當種子，
+// 使本次的前名次/進退步不被清空，且下一次的前名次/進退步跟著最新分數連動
+function recalcWindow(centerExam) {
+  var order = orderedExamNames();
+  var c = String(centerExam).trim();
+  var i = order.indexOf(c);
+  if (i < 0) return recalcChain([c]);
+  var start = Math.max(0, i - 1);
+  var names = order.slice(start, i + 2);
+  var seed = (start > 0) ? readClassRanks(order[start - 1]) : {};
+  return recalcChain(names, seed);
+}
+
+// ---------------- API 入口 ----------------
+function doGet(e) {
+  var params = (e && e.parameter) ? e.parameter : {};
+  if (params.action) return handleAPI(params);
+  // 列印專用頁（新分頁開啟，頂層文件列印，不受嵌入 iframe 影響）
+  if (params.print === 'slip') return printSlipPage(params.u, params.e);
+  if (params.print === 'report') return printReportPage(params.e, params.pw);
+  if (params.print === 'slips') return printSlipsPage(params.e, params.pw);
+  // 單頁版：學生＋老師同一頁，站內按鈕切換（Google Sites 嵌入 iframe 跳轉會被擋）
+  return HtmlService.createHtmlOutput(getAppHTML(params.page === 'teacher'))
+    .setTitle(getSystemTitle())
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+function doPost(e) {
+  return handleAPI((e && e.parameter) ? e.parameter : {});
+}
+
+function handleAPI(params) {
+  var result;
+  try {
+    result = apiCall(params.action || '', params);
+  } catch (err) {
+    result = { success: false, message: '伺服器錯誤：' + err.message };
+  }
+  return ContentService.createTextOutput(JSON.stringify(result))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+// google.script.run 用：apiCall(action, params)
+function apiCall(action, params) {
+  params = params || {};
+  try {
+    if (action === 'login') return hLogin(params.username, params.password);
+    if (action === 'scores') return hStudentScores(params.username, params.sheet || params.exam);
+    if (action === 'ping') return { success: true, message: '後端連線正常' };
+    if (action === 'teacher_login') return hTeacherLogin(params.password);
+    if (action === 'teacher_change_password') return hChangePassword(params.old_password, params.new_password);
+    if (action === 'config_get_title') return { success: true, title: getSystemTitle() };
+    if (action === 'config_set_title') return hConfigSetTitle(params.tpw, params.title);
+    if (action === 'exams_list') return { success: true, exams: listExamNames(), title: getSystemTitle() };
+    if (action === 'exam_create') return hExamCreate(params.tpw, params.name, params.copy_from);
+    if (action === 'exam_rename') return hExamRename(params.tpw, params.oldName || params.old_name, params.newName || params.new_name);
+    if (action === 'exam_delete') return hExamDelete(params.tpw, params.name, params.password);
+    if (action === 'subjects_list') return hSubjectsList(params.exam);
+    if (action === 'subject_create') return hSubjectCreate(params.tpw, params.code, params.name, params.weight);
+    if (action === 'subject_edit') return hSubjectEdit(params.tpw, params.oldName || params.old_name, params.name, params.weight);
+    if (action === 'grid') return hGrid(params.exam);
+    if (action === 'score_set') return hScoreSet(params.tpw, params.exam, params.student_id, params.subject_id, params.score);
+    if (action === 'score_bulk') return hScoreBulk(params.tpw, params.exam, params.cells, params.rows);
+    if (action === 'student_scores') return hStudentScores(params.username, params.exam);
+    if (action === 'student_trend') return hStudentTrend(params.username);
+    if (action === 'student_stats') return hStudentStats(params.exam);
+    if (action === 'students_list') return hStudentsList(params.tpw);
+    if (action === 'student_upsert') return hStudentUpsert(params.tpw, params);
+    if (action === 'audit_list') return hAuditList(params.tpw, params.limit);
+    if (action === 'recalc') return hRecalc(params.tpw, params.exam);
+    if (action === 'recalc_all') return hRecalc(params.tpw, null);
+    return { success: false, message: '未知 action：' + action };
+  } catch (err) {
+    return { success: false, message: '伺服器錯誤：' + err.message };
+  }
+}
+
+// ---------------- 登入 ----------------
+function hLogin(username, password) {
+  if (!username || !password) return { success: false, message: '帳號或密碼不可為空白' };
+  var accounts = readAccounts();
+  var found = null;
+  for (var i = 0; i < accounts.length; i++) {
+    if (accounts[i].account === String(username).trim()) { found = accounts[i]; break; }
+  }
+  if (!found) return { success: false, message: '無此帳號，請確認後再試' };
+  if (found.password !== String(password).trim()) return { success: false, message: '密碼錯誤，請再試一次' };
+  return {
+    success: true,
+    user: { username: found.account, seat: found.seat, name: found.name, class_no: found.classNo },
+    sheets: listExamNames(),
+    title: getSystemTitle()
+  };
+}
+
+function hTeacherLogin(password) {
+  if (!password) return { success: false, message: '請輸入管理密碼' };
+  if (!verifyTeacher(password)) return { success: false, message: '管理密碼錯誤' };
+  return { success: true, title: getSystemTitle() };
+}
+
+function hChangePassword(oldPw, newPw) {
+  if (!verifyTeacher(oldPw)) return { success: false, message: '舊密碼錯誤' };
+  if (!newPw || String(newPw).length < 6) return { success: false, message: '新密碼至少 6 碼' };
+  setConfig('TEACHER_PASSWORD', String(newPw));
+  logAudit('teacher', 'change_password', '管理密碼已變更');
+  return { success: true, message: '密碼已變更' };
+}
+
+function hConfigSetTitle(tpw, title) {
+  if (!verifyTeacher(tpw)) return { success: false, message: '需要老師權限' };
+  var t = String(title || '').trim();
+  if (!t) return { success: false, message: '標題不可空白' };
+  setConfig('SYSTEM_TITLE', t);
+  logAudit('teacher', 'edit_title', '系統標題改為：' + t);
+  return { success: true, title: t };
+}
+
+// ---------------- 考試 ----------------
+function hExamCreate(tpw, name, copyFrom) {
+  if (!verifyTeacher(tpw)) return { success: false, message: '需要老師權限' };
+  var nm = String(name || '').trim();
+  if (!nm) return { success: false, message: '考試名稱不可空白' };
+  if (isReserved(nm)) return { success: false, message: '名稱保留，請換一個' };
+  var ss = getSS();
+  if (ss.getSheetByName(nm)) return { success: false, message: '考試名稱重複' };
+  var sh = ss.insertSheet(nm);
+  if (copyFrom && ss.getSheetByName(copyFrom)) {
+    var src = ss.getSheetByName(copyFrom);
+    var lastCol = src.getLastColumn();
+    var head = src.getRange(1, 1, 1, lastCol).getValues()[0];
+    sh.getRange(1, 1, 1, head.length).setValues([head]);
+  } else {
+    sh.getRange(1, 1, 1, 2).setValues([['座號', '姓名']]);
+  }
+  var r = recalcChain();
+  var prevFilled = 0;
+  try {
+    var d = sh.getDataRange().getValues();
+    var h = d[0].map(function (x) { return String(x).trim(); });
+    var pi = h.indexOf('前名次');
+    if (pi >= 0) {
+      for (var i = 1; i < d.length; i++) {
+        if (d[i][pi] !== '' && d[i][pi] !== null) prevFilled++;
+      }
+    }
+  } catch (e) { /* 忽略 */ }
+  logAudit('teacher', 'create_exam', '新增考試：' + nm + ' prev_filled=' + prevFilled);
+  return { success: true, exam: nm, prev_filled: prevFilled, recalc: r };
+}
+
+function hExamRename(tpw, oldName, newName) {
+  if (!verifyTeacher(tpw)) return { success: false, message: '需要老師權限' };
+  var o = String(oldName || '').trim(), n = String(newName || '').trim();
+  if (!o || !n) return { success: false, message: '舊名稱與新名稱不可空白' };
+  if (isReserved(n)) return { success: false, message: '新名稱為保留名稱' };
+  var ss = getSS();
+  var sh = ss.getSheetByName(o);
+  if (!sh) return { success: false, message: '找不到考試：' + o };
+  if (o !== n && ss.getSheetByName(n)) return { success: false, message: '新名稱已存在' };
+  sh.setName(n);
+  logAudit('teacher', 'rename_exam', o + ' → ' + n);
+  return { success: true, exam: n };
+}
+
+function hExamDelete(tpw, name, password) {
+  if (!verifyTeacher(tpw)) return { success: false, message: '需要老師權限' };
+  if (!verifyTeacher(password)) return { success: false, message: '管理密碼錯誤，刪除未執行' };
+  var nm = String(name || '').trim();
+  var ss = getSS();
+  var sh = ss.getSheetByName(nm);
+  if (!sh) return { success: false, message: '找不到考試：' + nm };
+  ss.deleteSheet(sh);
+  var r = recalcChain();
+  logAudit('teacher', 'delete_exam', '刪除考試：' + nm + '（密碼確認）');
+  return { success: true, recalc: r };
+}
+
+// ---------------- 科目（各考試表頭欄位） ----------------
+function hSubjectsList(exam) {
+  var names = exam ? [exam] : orderedExamNames();
+  var seen = {}, out = [];
+  names.forEach(function (n) {
+    var sh = getSS().getSheetByName(n);
+    if (!sh) return;
+    var head = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0]
+      .map(function (x) { return String(x == null ? '' : x).trim(); });
+    var seatCol = findSeatCol(head), nameCol = findNameCol(head);
+    head.forEach(function (h) {
+      if (!h || seen[h]) return;
+      var idx = head.indexOf(h);
+      if (idx === seatCol || idx === nameCol) return;
+      seen[h] = true;
+      out.push({ id: h, code: h, name: h, weight: parseWeight(h, 1) });
+    });
+  });
+  return { success: true, subjects: out };
+}
+
+function hSubjectCreate(tpw, code, name, weight) {
+  if (!verifyTeacher(tpw)) return { success: false, message: '需要老師權限' };
+  var nm = String(name || code || '').trim();
+  if (!nm) return { success: false, message: '科目名稱不可空白' };
+  var w = (weight !== undefined && weight !== null && weight !== '') ? Number(weight) : parseWeight(nm, 1);
+  if (!isFinite(w) || w <= 0) return { success: false, message: '權重必須是正數' };
+  var finalName = isPureSubject(nm) ? syncWeightSuffix(nm, w) : nm;
+  var exams = orderedExamNames();
+  exams.forEach(function (n) {
+    var sh = getSS().getSheetByName(n);
+    var head = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0]
+      .map(function (x) { return String(x == null ? '' : x).trim(); });
+    if (head.indexOf(finalName) >= 0) return;
+    var at = -1;
+    for (var j = 0; j < head.length; j++) {
+      if (DERIVED_RE.test(head[j])) { at = j; break; }
+    }
+    if (at >= 0) {
+      sh.insertColumnBefore(at + 1);
+      sh.getRange(1, at + 1).setValue(finalName);
+    } else {
+      sh.getRange(1, head.length + 1).setValue(finalName);
+    }
+  });
+  var r = recalcChain();
+  logAudit('teacher', 'create_subject', '新增科目：' + finalName + ' 權重=' + w);
+  return { success: true, subject: finalName, recalc: r };
+}
+
+function hSubjectEdit(tpw, oldName, newName, weight) {
+  if (!verifyTeacher(tpw)) return { success: false, message: '需要老師權限' };
+  var o = String(oldName || '').trim();
+  var nm = String(newName == null ? o : newName).trim();
+  if (!o || !nm) return { success: false, message: '科目名稱不可空白' };
+  var exams = orderedExamNames();
+  var oldW = 1, foundAny = false;
+  exams.forEach(function (n) {
+    var sh = getSS().getSheetByName(n);
+    var head = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0]
+      .map(function (x) { return String(x == null ? '' : x).trim(); });
+    if (head.indexOf(o) >= 0) { foundAny = true; oldW = parseWeight(o, 1); }
+  });
+  if (!foundAny) return { success: false, message: '找不到科目：' + o };
+  var w;
+  if (weight !== undefined && weight !== null && weight !== '') w = Number(weight);
+  else if (nm !== o) w = parseWeight(nm, oldW);
+  else w = oldW;
+  if (!isFinite(w) || w <= 0) return { success: false, message: '權重必須是正數' };
+  var finalName = isPureSubject(nm) ? syncWeightSuffix(nm, w) : nm;
+  var dup = false;
+  exams.forEach(function (n) {
+    var sh = getSS().getSheetByName(n);
+    var head = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0]
+      .map(function (x) { return String(x == null ? '' : x).trim(); });
+    var idx = head.indexOf(o);
+    if (idx >= 0) {
+      if (finalName !== o && head.indexOf(finalName) >= 0) { dup = true; return; }
+      sh.getRange(1, idx + 1).setValue(finalName);
+    }
+  });
+  if (dup) return { success: false, message: '名稱重複：' + finalName };
+  var r = recalcChain();
+  logAudit('teacher', 'edit_subject', o + ' → ' + finalName + ' 權重=' + w);
+  return { success: true, name: finalName, weight: w, recalc: r };
+}
+
+// ---------------- 老師：全班矩陣 / 單格 / 整批 ----------------
+function hGrid(exam) {
+  var nm = String(exam || '').trim();
+  var sh = getSS().getSheetByName(nm);
+  if (!sh) return { success: false, message: '找不到考試：' + nm };
+  var data = sh.getDataRange().getValues();
+  if (data.length < 1) return { success: false, message: '工作表無資料' };
+  var headers = data[0].map(function (x) { return String(x == null ? '' : x).trim(); });
+  var seatCol = findSeatCol(headers), nameCol = findNameCol(headers);
+  var rowBySeat = {};
+  for (var i = 1; i < data.length; i++) {
+    var k = normSeat(data[i][seatCol]);
+    if (k && rowBySeat[k] == null) rowBySeat[k] = i;
+  }
+  var accounts = readAccounts();
+  accounts.sort(function (a, b) {
+    var x = parseFloat(a.seat), y = parseFloat(b.seat);
+    if (!isNaN(x) && !isNaN(y)) return x - y;
+    return String(a.seat) < String(b.seat) ? -1 : 1;
+  });
+  var students = accounts.map(function (a) {
+    return { id: a.seat, account: a.account, seat: a.seat, name: a.name, class_no: a.classNo, excluded: a.excluded };
+  });
+  var subjects = [];
+  headers.forEach(function (h) {
+    if (!h) return;
+    var idx = headers.indexOf(h);
+    if (idx === seatCol || idx === nameCol) return;
+    subjects.push({ id: h, code: h, name: h, weight: parseWeight(h, 1) });
+  });
+  var scores = {};
+  accounts.forEach(function (a) {
+    var ri = rowBySeat[normSeat(a.seat)];
+    subjects.forEach(function (s) {
+      var ci = headers.indexOf(s.id);
+      var v = (ri != null) ? data[ri][ci] : '';
+      scores[a.seat + '_' + s.id] = (v === '' || v == null) ? '' : v;
+    });
+  });
+  return { success: true, students: students, subjects: subjects, scores: scores };
+}
+
+function findRowBySeat(data, seatCol, seat) {
+  var key = normSeat(seat);
+  for (var i = 1; i < data.length; i++) {
+    if (normSeat(data[i][seatCol]) === key) return i;
+  }
+  return -1;
+}
+
+function hScoreSet(tpw, exam, studentId, subjectId, score) {
+  if (!verifyTeacher(tpw)) return { success: false, message: '需要老師權限' };
+  var sh = getSS().getSheetByName(String(exam || '').trim());
+  if (!sh) return { success: false, message: '找不到考試' };
+  var v = validScore(score);
+  if (!v.ok) return { success: false, message: v.msg };
+  var data = sh.getDataRange().getValues();
+  var headers = data[0].map(function (x) { return String(x == null ? '' : x).trim(); });
+  var seatCol = findSeatCol(headers);
+  var ci = headers.indexOf(String(subjectId || '').trim());
+  if (ci < 0) return { success: false, message: '找不到科目：' + subjectId };
+  if (DERIVED_RE.test(headers[ci])) return { success: false, message: '自動計算欄不可手改' };
+  var ri = findRowBySeat(data, seatCol, studentId);
+  if (ri < 0) return { success: false, message: '找不到座號：' + studentId };
+  if (v.value === null) sh.getRange(ri + 1, ci + 1).clearContent();
+  else sh.getRange(ri + 1, ci + 1).setValue(v.value);
+  logAudit('teacher', 'edit_cell', '考試=' + exam + ' 座號=' + studentId + ' 科目=' + subjectId + ' 分數=' + v.value);
+  var r = recalcWindow(exam);
+  return { success: true, score: v.value, recalc: r };
+}
+
+function hScoreBulk(tpw, exam, cells, rows) {
+  if (!verifyTeacher(tpw)) return { success: false, message: '需要老師權限' };
+  var nm = String(exam || '').trim();
+  var sh = getSS().getSheetByName(nm);
+  if (!sh) return { success: false, message: '找不到考試' };
+  var data = sh.getDataRange().getValues();
+  var headers = data[0].map(function (x) { return String(x == null ? '' : x).trim(); });
+  var seatCol = findSeatCol(headers);
+  var errors = [], count = 0;
+  var apply = function (seat, subject, score) {
+    var ci = headers.indexOf(String(subject).trim());
+    if (ci < 0) { errors.push('未知科目：' + subject); return; }
+    if (DERIVED_RE.test(headers[ci])) return; // 自動欄跳過，由重算填入
+    var ri = findRowBySeat(data, seatCol, seat);
+    if (ri < 0) { errors.push('座號不在名單：' + seat); return; }
+    var v = validScore(score);
+    if (!v.ok) { errors.push('座號=' + seat + ' 科目=' + subject + '：' + v.msg); return; }
+    data[ri][ci] = (v.value === null ? '' : v.value);
+    count++;
+  };
+  (cells || []).forEach(function (c) { apply(c.student_id, c.subject_id, c.score); });
+  (rows || []).forEach(function (r) {
+    if (!r || !r.scores) return;
+    for (var k in r.scores) {
+      if (Object.prototype.hasOwnProperty.call(r.scores, k)) apply(r.student_id, k, r.scores[k]);
+    }
+  });
+  if (!count) return { success: false, message: '無有效資料', errors: errors };
+  sh.getRange(1, 1, data.length, headers.length).setValues(data);
+  logAudit('teacher', 'bulk_upsert', '考試=' + nm + ' 寫入' + count + '格');
+  var r2 = recalcWindow(nm);
+  return { success: true, updated: count, errors: errors, recalc: r2 };
+}
+
+// ---------------- 學生：成績 / 走勢 / 統計 ----------------
+function findStudentRowInSheet(sh, seat) {
+  var data = sh.getDataRange().getValues();
+  if (data.length < 2) return { data: data, headers: [], rowIdx: -1 };
+  var headers = data[0].map(function (x) { return String(x == null ? '' : x).trim(); });
+  var seatCol = findSeatCol(headers);
+  var key = normSeat(seat);
+  var rowIdx = -1;
+  for (var i = 1; i < data.length; i++) {
+    if (normSeat(data[i][seatCol]) === key) { rowIdx = i; break; }
+  }
+  return { data: data, headers: headers, rowIdx: rowIdx, seatCol: seatCol };
+}
+
+function hStudentScores(username, examName) {
+  if (!username || !examName) return { success: false, message: '參數不完整' };
+  var accounts = readAccounts();
+  var me = null;
+  for (var i = 0; i < accounts.length; i++) {
+    if (accounts[i].account === String(username).trim()) { me = accounts[i]; break; }
+  }
+  if (!me) return { success: false, message: '找不到此帳號' };
+  var sh = getSS().getSheetByName(String(examName).trim());
+  if (!sh) return { success: false, message: '找不到考試：' + examName };
+  var f = findStudentRowInSheet(sh, me.seat);
+  if (f.rowIdx < 0) return { success: false, message: '找不到座號「' + me.seat + '」的成績資料' };
+  var headers = f.headers, row = f.data[f.rowIdx];
+  var formattedRow = row.map(function (val, idx) {
+    if (typeof val === 'number') {
+      var h = headers[idx] || '';
+      if (h.indexOf('平均') >= 0) return val.toFixed(2);
+      return val;
+    }
+    return String(val == null ? '' : val);
+  });
+  var scores = headers.map(function (h, idx) {
+    var raw = row[idx];
+    var val = (raw === '' || raw == null) ? null : raw;
+    return { subject: h, score: val };
+  });
+  var avgIdx = -1;
+  for (var a = 0; a < headers.length; a++) {
+    if (headers[a].indexOf('平均') >= 0) { avgIdx = a; break; }
+  }
+  var official = (avgIdx >= 0) ? toNum(row[avgIdx]) : null;
+  var sum = 0, n = 0;
+  var seatCol = findSeatCol(headers), nameCol = findNameCol(headers);
+  headers.forEach(function (h, idx) {
+    if (idx === seatCol || idx === nameCol) return;
+    if (!isPureSubject(h)) return;
+    var v = toNum(row[idx]);
+    if (v !== null) { sum += v; n++; }
+  });
+  var avg = n ? Math.round((sum / n) * 100) / 100 : null;
+  // 結構化：各科（分數＋配對排名）與總結（總分/平均/班名次/前名次/進退步）分開
+  var cellVal = function (idx) {
+    var raw = row[idx];
+    return (raw === '' || raw == null) ? null : raw;
+  };
+  var rankIdxFor = function (pi) {
+    var subj = stripWeightSuffix(headers[pi]);
+    for (var j = 0; j < headers.length; j++) {
+      var h = headers[j];
+      if (!/排名|名次/.test(h)) continue;
+      if (h === '班名次' || h === '前名次') continue;
+      var base = h.replace(/排名|名次/g, '');
+      if (!base) continue;
+      if (subj.indexOf(base) === 0) return j;
+    }
+    return -1;
+  };
+  var subjRows = [];
+  headers.forEach(function (h, idx) {
+    if (idx === seatCol || idx === nameCol || !h) return;
+    if (!isPureSubject(h)) return;
+    var ri = rankIdxFor(idx);
+    subjRows.push({ name: stripWeightSuffix(h), full: h, score: cellVal(idx), rank: ri >= 0 ? cellVal(ri) : null });
+  });
+  var summaryRows = [];
+  headers.forEach(function (h, idx) {
+    if (idx === seatCol || idx === nameCol || !h) return;
+    if (isPureSubject(h)) return;
+    if (/排名|名次/.test(h) && h !== '班名次' && h !== '前名次') return;
+    summaryRows.push({ name: h, value: cellVal(idx) });
+  });
+  return { success: true, exam: String(examName).trim(), headers: headers, row: formattedRow, scores: scores, average: avg, official_average: official, subjects: subjRows, summary: summaryRows };
+}
+
+function hStudentTrend(username) {
+  var accounts = readAccounts();
+  var me = null;
+  for (var i = 0; i < accounts.length; i++) {
+    if (accounts[i].account === String(username).trim()) { me = accounts[i]; break; }
+  }
+  if (!me) return { success: false, message: '找不到此帳號' };
+  var exams = orderedExamNames();
+  var trend = exams.map(function (n) {
+    var sh = getSS().getSheetByName(n);
+    var avg = null, rank = null;
+    if (sh) {
+      var f = findStudentRowInSheet(sh, me.seat);
+      if (f.rowIdx >= 0) {
+        for (var j = 0; j < f.headers.length; j++) {
+          if (avg === null && f.headers[j].indexOf('平均') >= 0) avg = toNum(f.data[f.rowIdx][j]);
+          if (f.headers[j] === '班名次') rank = toNum(f.data[f.rowIdx][j]);
+        }
+      }
+    }
+    return { exam_id: n, exam_name: n, average: avg, rank: rank };
+  });
+  return { success: true, trend: trend };
+}
+
+function hStudentStats(exam) {
+  var nm = String(exam || '').trim();
+  var sh = getSS().getSheetByName(nm);
+  if (!sh) return { success: false, message: '找不到考試' };
+  var data = sh.getDataRange().getValues();
+  if (data.length < 2) return { success: true, stats: [] };
+  var headers = data[0].map(function (x) { return String(x == null ? '' : x).trim(); });
+  var seatCol = findSeatCol(headers), nameCol = findNameCol(headers);
+  var accounts = readAccounts();
+  var kidSet = {};
+  accounts.forEach(function (a) { if (!a.excluded) kidSet[normSeat(a.seat)] = true; });
+  var stats = [];
+  for (var c = 0; c < headers.length; c++) {
+    if (c === seatCol || c === nameCol) continue;
+    if (!isPureSubject(headers[c])) continue;
+    var vals = [];
+    for (var i = 1; i < data.length; i++) {
+      if (!kidSet[normSeat(data[i][seatCol])]) continue;
+      var v = toNum(data[i][c]);
+      if (v !== null) vals.push(v);
+    }
+    var nmShort = stripWeightSuffix(headers[c]);
+    if (!vals.length) { stats.push({ name: nmShort, n: 0 }); continue; }
+    var sum = vals.reduce(function (a, b) { return a + b; }, 0);
+    var pass = vals.filter(function (x) { return x >= 60; }).length;
+    stats.push({
+      name: nmShort, n: vals.length,
+      avg: Math.round(sum / vals.length * 100) / 100,
+      max: Math.max.apply(null, vals), min: Math.min.apply(null, vals),
+      rate: Math.round(pass / vals.length * 1000) / 10,
+      g90: vals.filter(function (x) { return x >= 90; }).length,
+      g80: vals.filter(function (x) { return x >= 80 && x < 90; }).length,
+      g70: vals.filter(function (x) { return x >= 70 && x < 80; }).length,
+      g60: vals.filter(function (x) { return x >= 60 && x < 70; }).length,
+      g0: vals.filter(function (x) { return x < 60; }).length
+    });
+  }
+  return { success: true, stats: stats };
+}
+
+// ---------------- 老師：學生 / 稽核 / 重算 ----------------
+function hStudentsList(tpw) {
+  if (!verifyTeacher(tpw)) return { success: false, message: '需要老師權限' };
+  var students = readAccounts().map(function (a) {
+    return { id: a.account, account: a.account, seat: a.seat, name: a.name, class_no: a.classNo, active: 1, excluded: a.excluded };
+  });
+  return { success: true, students: students };
+}
+
+function hStudentUpsert(tpw, p) {
+  if (!verifyTeacher(tpw)) return { success: false, message: '需要老師權限' };
+  var account = String(p.account || '').trim();
+  var seat = String(p.seat || '').trim();
+  var name = String(p.name || '').trim();
+  if (!account || !seat || !name) return { success: false, message: '帳號/座號/姓名不可空白' };
+  var classNo = String(p.class_no || getConfig('CLASS_NO', DEFAULT_CLASS_NO)).trim() || DEFAULT_CLASS_NO;
+  var excl = p.excluded ? 1 : 0;
+  var ss = getSS();
+  var sh = ss.getSheetByName(ACCOUNT_SHEET);
+  var data = sh.getDataRange().getValues();
+  if (data[0].length < 5) sh.getRange(1, 5).setValue('班級');
+  if (data[0].length < 6) sh.getRange(1, 6).setValue('測試');
+  var ri = -1;
+  for (var i = 1; i < data.length; i++) {
+    if (String(data[i][0]).trim() === account) { ri = i + 1; break; }
+  }
+  if (ri < 0) {
+    if (!p.password) return { success: false, message: '新增學生需提供初始密碼' };
+    sh.appendRow([account, String(p.password), seat, name, classNo, excl]);
+  } else {
+    if (p.password) sh.getRange(ri, 2).setValue(String(p.password));
+    sh.getRange(ri, 3, 1, 4).setValues([[seat, name, classNo, excl]]);
+  }
+  logAudit('teacher', 'upsert_student', '帳號=' + account + (p.password ? '（重設密碼）' : '') + ' 測試=' + excl);
+  var r = recalcChain();
+  return { success: true, recalc: r };
+}
+
+function hAuditList(tpw, limit) {
+  if (!verifyTeacher(tpw)) return { success: false, message: '需要老師權限' };
+  var lim = parseInt(limit || 200, 10);
+  if (!isFinite(lim) || lim < 1) lim = 200;
+  if (lim > 500) lim = 500;
+  var sh = ensureAuditSheet();
+  var data = sh.getDataRange().getValues();
+  var logs = [];
+  for (var i = data.length - 1; i >= 1 && logs.length < lim; i--) {
+    var t = data[i][0] instanceof Date ? Math.floor(data[i][0].getTime() / 1000) : 0;
+    logs.push({ created_at: t, teacher: String(data[i][1] || ''), action: String(data[i][2] || ''), detail: String(data[i][3] || '') });
+  }
+  return { success: true, logs: logs };
+}
+
+function hRecalc(tpw, exam) {
+  if (!verifyTeacher(tpw)) return { success: false, message: '需要老師權限' };
+  var r, label;
+  if (exam) {
+    r = recalcWindow(exam);
+    label = String(exam).trim();
+  } else {
+    r = recalcChain();
+    label = orderedExamNames().join(',');
+  }
+  logAudit('teacher', 'recalc', '考試=' + label);
+  return { success: true, recalc: r };
+}
+
+// （舊雙頁版 getStudentHTML/getTeacherHTML 已移除，現行由單頁版 getAppHTML 提供；歷史版本請見 git）
+
+
+// ============================================================
+// 單頁版共用 HEAD（學生＋老師樣式以 #view-student / #view-teacher 隔離）
+// ============================================================
+function appHead(TITLE) {
+  return `<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>${escHtml(TITLE)}</title>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+<style>
+:root{--rose:#f06292;--leaf:#66bb6a;--pine:#2e7d32;--text-dark:#1f3a2d;--text-mid:#3d7a52;--text-soft:#7da88c;--pass-blue:#1565c0;--fail-red:#d81b60;--fail-bg:rgba(255,200,210,.45);--glass-white:rgba(255,255,255,.55);--glass-border:rgba(255,255,255,.7);--glass-shadow:0 8px 32px rgba(46,125,50,.18);--radius:18px;--radius-sm:12px}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Noto Sans TC',sans-serif;min-height:100vh;color:var(--text-dark);background:radial-gradient(ellipse 55% 40% at 12% 8%,rgba(165,214,167,.5) 0%,transparent 60%),radial-gradient(ellipse 45% 35% at 88% 18%,rgba(200,230,201,.55) 0%,transparent 60%),radial-gradient(ellipse 50% 42% at 76% 84%,rgba(165,214,167,.4) 0%,transparent 62%),linear-gradient(160deg,#eef7f0 0%,#f4faf5 45%,#e3f1e6 75%,#f7fbf8 100%);background-attachment:fixed}
+#view-student .app{position:relative;z-index:1;min-height:100vh;display:flex;flex-direction:column}
+#view-student header{background:rgba(255,255,255,.45);backdrop-filter:blur(20px);border-bottom:1.5px solid rgba(255,255,255,.75);position:sticky;top:0;z-index:100}
+#view-student .header-inner{max-width:1000px;margin:0 auto;padding:13px 20px;display:grid;grid-template-columns:1fr auto 1fr;align-items:center;gap:12px}
+#view-student .logo-icon{width:40px;height:40px;border-radius:10px;background:linear-gradient(135deg,#66bb6a,#1b5e20);display:flex;align-items:center;justify-content:center;font-size:20px;font-weight:900;color:#fff}
+#view-student h1{font-size:clamp(15px,3.5vw,21px);font-weight:900;color:#1b5e20;letter-spacing:2px;text-align:center}
+#view-student h1 span{display:block;font-size:.58em;font-weight:400;color:var(--text-soft)}
+#view-student #sys-title{display:block;font-size:1.35em;font-weight:900;color:#1b5e20;letter-spacing:3px;line-height:1.3}
+#view-student #logout-btn{background:rgba(255,255,255,.75);color:#2e7d32;border:1.5px solid #66bb6a;border-radius:8px;padding:8px 16px;font-size:13px;font-weight:700;cursor:pointer;display:none}
+#view-student main{flex:1;max-width:680px;width:100%;margin:0 auto;padding:28px 16px 40px}
+#view-student .glass{background:var(--glass-white);backdrop-filter:blur(18px);border:1.5px solid var(--glass-border);border-radius:var(--radius);box-shadow:var(--glass-shadow)}
+#view-student .card{padding:32px 30px}
+#view-student .card-title{font-size:17px;font-weight:700;color:var(--pine);margin-bottom:22px}
+#view-student .form-group{margin-bottom:18px}
+#view-student label{display:block;font-size:13px;color:var(--text-mid);margin-bottom:6px}
+#view-student input,#view-student select{width:100%;padding:11px 15px;background:rgba(255,255,255,.65);border:1.5px solid rgba(102,187,106,.4);border-radius:var(--radius-sm);font-size:15px;font-family:inherit;outline:none}
+#view-student input:focus,#view-student select:focus{border-color:var(--leaf);box-shadow:0 0 0 3px rgba(102,187,106,.18)}
+#view-student .btn-primary{width:100%;padding:12px;background:linear-gradient(135deg,var(--leaf),var(--pine));color:#fff;border:none;border-radius:var(--radius-sm);font-size:16px;font-weight:700;cursor:pointer;font-family:inherit}
+#view-student .msg-error{background:rgba(252,228,236,.85);border:1.5px solid rgba(240,98,146,.45);color:#a01a5a;border-radius:var(--radius-sm);padding:11px 14px;font-size:13px;margin-top:12px;display:none;white-space:pre-wrap}
+#view-student .msg-loading{text-align:center;color:var(--text-mid);font-size:14px;padding:12px;display:none}
+#view-student #score-page{display:none}
+#view-student .student-banner{padding:16px 22px;margin-bottom:16px;display:flex;gap:18px;flex-wrap:wrap}
+#view-student .info-label{font-size:12px;background:rgba(102,187,106,.18);border-radius:6px;padding:2px 8px;color:var(--text-soft)}
+#view-student .info-value{font-size:17px;font-weight:900;color:var(--pine)}
+#view-student .exam-selector{padding:16px 22px;margin-bottom:16px}
+#view-student .table-header{padding:13px 18px;font-weight:700;color:var(--pine)}
+#view-student table{width:100%;border-collapse:collapse}
+#view-student thead th{padding:10px 16px;text-align:left;color:var(--pine);font-size:13px;border-bottom:1.5px solid rgba(102,187,106,.25)}
+#view-student tbody tr:nth-child(odd){background:rgba(255,255,255,.6)}
+#view-student tbody tr:nth-child(even){background:rgba(232,245,233,.55)}
+#view-student tbody td{padding:10px 16px;border-bottom:1px solid rgba(165,214,167,.2)}
+#view-student .pass{color:var(--pass-blue)!important;font-weight:700}
+#view-student .fail{color:var(--fail-red)!important;font-weight:700}
+#view-student .fail-row td{background:var(--fail-bg)!important}
+#view-student footer{text-align:center;padding:14px;color:var(--text-soft);font-size:12px}
+#view-student footer a{color:#2e7d32;font-weight:700;text-decoration:none;border-bottom:1px solid #66bb6a}
+#view-student .top-link{text-align:center;margin-top:18px}
+#view-student .top-link button{display:inline-block;padding:10px 26px;border-radius:999px;background:rgba(255,255,255,.75);border:1.5px solid #66bb6a;color:#2e7d32;font-weight:700;font-size:13px;cursor:pointer;font-family:inherit}
+#view-student #stat-table table{font-size:11px;min-width:600px}
+#view-student #stat-table th,#view-student #stat-table td{padding:6px 4px;text-align:center}
+#view-student #trend-cv{display:block;margin:0 auto}
+#view-student #print-btn-row{display:none;text-align:center;margin-top:16px}
+#view-student .btn-print{padding:10px 26px;border-radius:999px;background:rgba(255,255,255,.75);border:1.5px solid #66bb6a;color:#2e7d32;font-weight:700;font-size:14px;cursor:pointer;font-family:inherit}
+#print-slip{display:none}
+#view-teacher header{background:rgba(255,255,255,.6);backdrop-filter:blur(16px);border-bottom:1.5px solid #fff;position:sticky;top:0;z-index:50}
+#view-teacher .hd{max-width:1200px;margin:0 auto;padding:12px 20px;display:flex;justify-content:space-between;align-items:center}
+#view-teacher h1{font-size:18px;font-weight:900;color:#2e7d32;font-family:'Noto Sans TC',sans-serif}
+#view-teacher main{max-width:1200px;margin:0 auto;padding:20px}
+#view-teacher .card{background:rgba(255,255,255,.6);border:1.5px solid #fff;border-radius:14px;padding:20px;margin-bottom:16px;box-shadow:0 8px 32px rgba(46,125,50,.15);font-family:'Noto Sans TC',sans-serif}
+#view-teacher label{font-size:13px;color:#3d7a52;display:block;margin-bottom:4px}
+#view-teacher input,#view-teacher select,#view-teacher textarea{padding:9px 12px;border:1.5px solid rgba(102,187,106,.45);border-radius:8px;font-size:14px;font-family:inherit;background:rgba(255,255,255,.8);outline:none;color:#1f3a2d}
+#view-teacher input:focus,#view-teacher select:focus,#view-teacher textarea:focus{border-color:#66bb6a;box-shadow:0 0 0 3px rgba(102,187,106,.18)}
+#view-teacher button{padding:9px 16px;border:none;border-radius:8px;font-weight:700;cursor:pointer;font-family:inherit;font-size:14px}
+#view-teacher .btn-p{background:linear-gradient(135deg,#66bb6a,#2e7d32);color:#fff}
+#view-teacher .btn-g{background:#fff;border:1.5px solid #bfe3c6;color:#2e7d32}
+#view-teacher .btn-r{background:linear-gradient(135deg,#ec407a,#ad1457);color:#fff}
+#view-teacher .btn-s{padding:4px 10px;font-size:12px}
+#view-teacher .row{display:flex;gap:10px;flex-wrap:wrap;align-items:end}
+#view-teacher .grid-wrap{overflow-x:auto;overflow-y:auto;max-height:62vh;border:1.5px solid rgba(102,187,106,.3);border-radius:10px;background:#fff}
+#view-teacher table.grid{border-collapse:separate;border-spacing:0;width:100%}
+#view-teacher table.grid th,#view-teacher table.grid td{border-bottom:1px solid #eee;border-right:1px solid #eee;padding:0;white-space:nowrap}
+#view-teacher table.grid th{background:linear-gradient(180deg,#e9f5ec,#d9ecdd);padding:8px 4px;font-size:12px;color:#2e7d32;position:sticky;top:0;z-index:2}
+#view-teacher table.grid th:first-child,#view-teacher table.grid td:first-child,#view-teacher table.grid th:nth-child(2),#view-teacher table.grid td:nth-child(2){position:sticky;z-index:1;background:#f7fbf8}
+#view-teacher table.grid th:first-child{left:0;min-width:44px}
+#view-teacher table.grid td:first-child{left:0;min-width:44px}
+#view-teacher table.grid th:nth-child(2){left:44px;min-width:66px}
+#view-teacher table.grid td:nth-child(2){left:44px;min-width:66px}
+#view-teacher table.grid td.c{padding:0}
+#view-teacher table.grid input.cell{border:none;border-radius:0;width:100%;min-width:64px;padding:8px 2px;font-size:13px;text-align:center;background:transparent}
+#view-teacher table.grid input.cell:focus{background:#fff7e0;box-shadow:inset 0 0 0 2px #66bb6a}
+#view-teacher table.grid td.ro{padding:7px 4px!important;text-align:center;font-size:13px;color:#3d7a52}
+#view-teacher .test-badge{display:inline-block;background:#ff9800;color:#fff;font-size:10px;font-weight:900;border-radius:6px;padding:1px 5px;margin-left:4px}
+#view-teacher tr.test-row td{background:#fff8e1!important}
+#view-teacher .badge{display:inline-block;font-size:11px;font-weight:700;border-radius:20px;padding:2px 10px;background:rgba(46,125,50,.12);color:#2e7d32}
+#view-teacher input.cell.saved{background:#e8f5e9}
+#view-teacher input.cell.saving{background:#fff9c4}
+#view-teacher input.cell.err{background:#f8bbd0}
+#view-teacher input.cell.auto{background:#e9f5ec;color:#5e35b1;cursor:not-allowed}
+#view-teacher table.sub{border-collapse:collapse;width:100%;background:#fff;border-radius:8px;overflow:hidden}
+#view-teacher table.sub th,#view-teacher table.sub td{border:1px solid #cfe6d4;padding:6px 8px;font-size:13px;text-align:left}
+#view-teacher table.sub th{background:#e9f5ec;color:#2e7d32}
+#view-teacher table.sub input{padding:6px 8px;font-size:13px}
+#view-teacher table.sub input.w{width:70px}
+#view-teacher .info{font-size:13px;color:#3d7a52;margin-top:8px;white-space:pre-wrap}
+#view-teacher .err-box{background:#fce4ec;border:1px solid #f06292;color:#a01a5a;border-radius:8px;padding:10px;font-size:13px;margin-top:8px;display:none;white-space:pre-wrap}
+#view-teacher #app{display:none}
+#view-teacher .tabs{display:flex;gap:8px;margin-bottom:12px}
+#view-teacher .tabs button{background:#fff;border:1.5px solid #bfe3c6;color:#2e7d32}
+#view-teacher .tabs button.on{background:#2e7d32;color:#fff}
+#view-teacher .hint{font-size:12px;color:#7da88c;line-height:1.7}
+#view-teacher #modal-overlay{display:none;position:fixed;inset:0;background:rgba(31,58,45,.45);z-index:200;align-items:center;justify-content:center;padding:16px}
+#view-teacher #modal-overlay.show{display:flex}
+#view-teacher #modal-box{background:#fff;border-radius:16px;max-width:420px;width:100%;padding:26px 24px;text-align:center}
+#view-teacher #modal-box.ok{border-top:6px solid #43a047}
+#view-teacher #modal-box.err{border-top:6px solid #ec407a}
+#view-teacher #modal-icon{font-size:44px;line-height:1}
+#view-teacher #modal-title{font-size:18px;font-weight:900;color:#1f3a2d;margin:10px 0 6px}
+#view-teacher #modal-msg{font-size:14px;color:#3d7a52;white-space:pre-wrap;margin-bottom:18px;line-height:1.8}
+#view-teacher .switch-link{display:inline-block;font-size:12px;font-weight:700;color:#2e7d32!important;background:rgba(255,255,255,.85);border:1.5px solid #66bb6a;border-radius:999px;padding:5px 15px;font-family:inherit;cursor:pointer}
+#view-teacher textarea#bulk{width:100%;height:160px;font-family:monospace}
+#print-area{display:none}
+@page{size:A4;margin:10mm}
+@media print{
+#view-teacher{display:none!important}
+#view-student .app,#view-student #print-btn-row{display:none!important}
+#print-slip{display:block!important;color:#000}
+#print-slip h2{font-size:17px;text-align:center;margin-bottom:1px}
+#print-slip .sl-sub{text-align:center;font-size:11px;margin-bottom:3px}
+#print-slip .sl-info{display:flex;gap:24px;justify-content:center;font-size:12px;margin:6px 0;border-top:2px solid #333;border-bottom:1px solid #333;padding:4px 0}
+#print-slip table{border-collapse:collapse;width:100%;margin-top:4px}
+#print-slip th,#print-slip td{border:1px solid #333;padding:5px 10px;font-size:13px;text-align:center}
+#print-slip table.scores th,#print-slip table.scores td{font-size:10.5px;padding:2px 10px}
+#print-slip td.sub{text-align:left}
+#print-slip td.fail{color:#c00!important;font-weight:900}
+#print-slip td.pass{color:#1565c0!important;font-weight:700}
+#print-slip .sl-foot{font-size:10px;margin-top:4px}
+#print-slip h3{font-size:13px;text-align:center;margin:8px 0 3px}
+#print-slip svg.trend{width:100%;height:auto;display:block}
+#print-slip table.compact th,#print-slip table.compact td{font-size:8.5px;padding:2px 2px}
+}
+@media print{
+#view-student{display:none!important}
+#view-teacher header,#view-teacher main,#view-teacher #modal-overlay{display:none!important}
+#print-area{display:block!important;color:#000}
+#print-area h2{font-size:18px;text-align:center;margin-bottom:2px}
+#print-area .rp-sub{text-align:center;font-size:11px;margin-bottom:6px}
+#print-area table{border-collapse:collapse;width:100%;table-layout:fixed}
+#print-area th,#print-area td{border:1px solid #333;padding:2px 3px;font-size:9.5px;text-align:center;white-space:nowrap;overflow:hidden}
+#print-area th{background:#eee!important;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+#print-area td.name{text-align:left}
+#print-area td.fail{color:#c00!important;font-weight:900}
+#print-area tr.test td{background:#f0f0f0!important;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+#print-area .rp-foot{font-size:10px;margin-top:6px}
+#print-area h3{font-size:14px;text-align:center;margin:10px 0 4px}
+}
+</style>
+</head>`;
+}
+
+// ============================================================
+// 單頁版：學生視圖（按鈕切換，無跳頁）
+// ============================================================
+function appStudentView(TITLE) {
+  return `<div id="view-student"><div class="app">
+<header><div class="header-inner">
+<div></div>
+<div style="display:flex;align-items:center;gap:11px;justify-content:center"><div class="logo-icon">福</div><h1><span id="sys-title">${escHtml(TITLE)}</span><span>Grade Inquiry System</span></h1></div>
+<div style="display:flex;justify-content:flex-end"><button id="logout-btn" onclick="logout()">登出</button></div>
+</div></header>
+<main>
+<div id="login-page"><div class="glass card">
+<div class="card-title">學生登入</div>
+<div class="form-group"><label>帳號</label><input id="username" placeholder="請輸入帳號"></div>
+<div class="form-group"><label>密碼</label><input id="password" type="password" placeholder="請輸入密碼" onkeydown="if(event.key==='Enter')doLogin()"></div>
+<button class="btn-primary" id="login-btn" onclick="doLogin()">登 入</button>
+<div class="msg-loading" id="login-loading">驗證中…</div>
+<div class="msg-error" id="login-error"></div>
+<div class="top-link"><button onclick="gotoTeacher()">老師編修入口 →</button></div>
+</div></div>
+<div id="score-page">
+<div class="glass student-banner"><div><span class="info-label">座號</span> <span class="info-value" id="seat">—</span></div><div><span class="info-label">姓名</span> <span class="info-value" id="sname">—</span></div><div><span class="info-label">平均</span> <span class="info-value" id="avg">—</span></div></div>
+<div class="glass exam-selector"><div class="form-group" style="margin:0"><label>選擇考試</label><select id="exam-select" onchange="loadScores()"><option value="">-- 請選擇 --</option></select></div>
+<div class="msg-loading" id="score-loading">載入中…</div><div class="msg-error" id="score-error"></div></div>
+<div class="glass" id="score-wrap" style="display:none"><div class="table-header" id="score-title">成績明細</div><table><thead><tr><th>科目</th><th>分數</th><th>排名</th></tr></thead><tbody id="tbody"></tbody></table></div>
+<div class="glass" id="sum-wrap" style="display:none;margin-top:16px"><div class="table-header">總分與名次</div><table><thead><tr><th>項目</th><th>內容</th></tr></thead><tbody id="sum-tbody"></tbody></table></div>
+<div class="glass" id="radar-card" style="display:none;padding:16px 22px;margin-top:16px">
+<div class="card-title" style="margin-bottom:8px">各科雷達圖</div>
+<div style="text-align:center;overflow-x:auto"><canvas id="radar-cv"></canvas></div>
+<div style="font-size:12px;color:#7da88c;margin-top:6px">滿分100分・紅點為待加強科目（僅螢幕顯示，不列印）</div>
+</div>
+<div class="glass" id="stat-card" style="display:none;padding:16px 22px;margin-top:16px">
+<div class="card-title" style="margin-bottom:8px">全班統計</div>
+<div id="stat-table" style="overflow-x:auto"></div>
+</div>
+</div>
+<div id="print-btn-row"><button class="btn-print" onclick="printSlip()">列印個人成績單</button></div>
+<div class="glass" id="trend-card" style="display:none;padding:16px 22px;margin-top:16px">
+<div class="card-title" style="margin-bottom:8px">歷次走勢</div>
+<div style="overflow-x:auto"><canvas id="trend-cv"></canvas></div>
+<div style="font-size:12px;color:#7da88c;margin-top:6px">藍線＝平均（左軸）　紅線＝班名次（右軸，越上面越好）</div>
+</div>
+</main>
+<footer>程式設計：<a href="https://www.facebook.com/profile.php?id=61590607147918" target="_blank" rel="noopener">3C不正師</a></footer>
+</div>
+</div>`;
+}
+
+// ============================================================
+// 單頁版：老師視圖（ID 已去衝突：t-logout-btn / t-stat-card / tLogout）
+// ============================================================
+function appTeacherView() {
+  return `<div id="view-teacher" style="display:none">
+<header><div class="hd"><h1>老師成績管理 <button class="switch-link" onclick="gotoStudent()">回學生端</button></h1><div><button class="btn-g btn-s" id="pw-btn" style="display:none;margin-right:8px" onclick="togglePw()">變更密碼</button><button class="btn-g btn-s" id="t-logout-btn" style="display:none" onclick="tLogout()">登出</button></div></div></header>
+<main>
+<div class="card" id="login-card">
+<h3>老師登入</h3><br>
+<div class="row"><div><label>管理密碼</label><input id="t-pw" type="password" placeholder="請輸入管理密碼" onkeydown="if(event.key==='Enter')tLogin()" style="width:260px"></div><div><label>&nbsp;</label><button class="btn-p" onclick="tLogin()">登入</button></div></div>
+<div class="err-box" id="login-err"></div>
+</div>
+
+<div id="app">
+<div class="tabs">
+<button id="tab-grade" class="on" onclick="showTab('grade')">成績編修</button>
+<button id="tab-exam" onclick="showTab('exam')">考試科目</button>
+<button id="tab-stu" onclick="showTab('stu')">學生管理</button>
+<button id="tab-audit" onclick="showTab('audit')">操作紀錄</button>
+</div>
+
+<div class="card" id="panel-grade">
+<div class="row">
+<div><label>考試</label><select id="exam-sel" onchange="loadGrid()" style="min-width:260px"></select></div>
+<div><label>&nbsp;</label><button class="btn-p" onclick="loadGrid()">載入</button></div>
+<div><label>&nbsp;</label><button class="btn-g" onclick="openBulk()">整班貼上</button></div>
+<div><label>&nbsp;</label><button class="btn-g" onclick="openSingle()">單科貼上</button></div>
+<div><label>&nbsp;</label><button class="btn-g" onclick="recalcCurrent()">重算本次</button></div>
+<div><label>&nbsp;</label><button class="btn-g" onclick="printReport()">列印總表(PDF)</button></div>
+<div><label>&nbsp;</label><button class="btn-g" onclick="printSlips()">全班成績單(PDF)</button></div>
+<div><label>&nbsp;</label><button class="btn-g" onclick="exportCSV()">匯出CSV</button></div>
+<span class="hint">點白格直接改，離開自動存並即時重算總分/排名。灰底為自動計算欄，不可手改。支援 Excel 複製多格後點一格 Ctrl+V 擴散貼上。</span>
+</div>
+<div class="info" id="grid-info"></div>
+<div class="grid-wrap" style="margin-top:10px"><table class="grid"><thead id="gh"></thead><tbody id="gb"></tbody></table></div>
+</div>
+<div class="card" id="t-stat-card" style="display:none"></div>
+
+<div class="card" id="single-card" style="display:none;border:2px dashed #2e7d32">
+<h3>單科整欄貼上</h3>
+<p class="hint">從 Excel 複製一整欄分數（座號由小到大往下排），選好科目後貼上。空白列自動跳過不覆蓋。</p>
+<div class="row">
+<div><label>填入科目</label><select id="single-sub" style="min-width:180px"></select></div>
+<div><label>&nbsp;</label><button class="btn-p" onclick="applySingle()">填入</button></div>
+<div><label>&nbsp;</label><button class="btn-g" onclick="document.getElementById('single-card').style.display='none'">關閉</button></div>
+</div>
+<textarea id="single" placeholder="每列一個分數（座號順序）" style="width:100%;height:140px;font-family:monospace;margin-top:8px"></textarea>
+<div class="info" id="single-info"></div><div class="err-box" id="single-err"></div>
+</div>
+
+<div class="card" id="bulk-card" style="display:none;border:2px dashed #2e7d32">
+<h3>一次貼上全班成績</h3>
+<p class="hint">從試算表 / Excel 複製含表頭的範圍貼到下方。第一列是表頭（座號 / 姓名 / 國文 / 英文 …），科目名需與系統科目相符。</p>
+<textarea id="bulk" placeholder="貼上 TSV（Excel 複製的內容）"></textarea>
+<div class="row" style="margin-top:8px"><button class="btn-p" onclick="applyBulk()">寫入</button><button class="btn-g" onclick="document.getElementById('bulk-card').style.display='none'">關閉</button></div>
+<div class="info" id="bulk-info"></div><div class="err-box" id="bulk-err"></div>
+</div>
+
+<div class="card" id="panel-exam" style="display:none">
+<h3>系統標題名稱</h3>
+<p class="hint">顯示在學生端與老師端頂部的大標題，儲存後重新整理頁面即生效。</p>
+<div class="row">
+<div><label>系統標題 *</label><input id="sys-title-input" style="width:320px"></div>
+<div><label>&nbsp;</label><button class="btn-p" onclick="saveTitle()">儲存標題</button></div>
+</div>
+<div class="info" id="title-info"></div>
+<hr style="margin:16px 0;border:none;border-top:1px solid #cfe6d4">
+<h3>新增考試次數</h3>
+<p class="hint">新增時會自動把上一次考試的班名次帶入本次前名次。</p>
+<div class="row">
+<div><label>考試名稱 *</label><input id="ex-name" placeholder="114-1 第二次段考" style="width:260px"></div>
+<div><label>複製欄位結構自</label><select id="ex-copy"><option value="">(不複製/空白)</option></select></div>
+<div><label>&nbsp;</label><button class="btn-p" onclick="createExam()">新增考試</button></div>
+</div>
+<div class="info" id="exam-info"></div>
+<h3 style="margin-top:16px">科目管理（名稱尾端 *N 即權重，如 國文*5；改名稱或權重會即時重算全部考試）</h3><br>
+<div class="row"><div><label>名稱</label><input id="sub-name" placeholder="英文*3"></div><div><label>權重</label><input id="sub-weight" placeholder="3" style="width:80px"></div><div><label>&nbsp;</label><button class="btn-p" onclick="createSubject()">新增科目</button></div><div><label>&nbsp;</label><button class="btn-g" onclick="recalcAll()">全部重算</button></div></div>
+<div id="sub-table" style="margin-top:10px"></div>
+<div class="info" id="sub-info"></div>
+<h3 style="margin-top:16px">現有考試（可改名 / 刪除）</h3><div class="info" id="exam-list"></div>
+</div>
+
+<div class="card" id="del-card" style="display:none;border:2px dashed #ec407a">
+<h3>刪除考試 <button class="btn-g btn-s" style="float:right" onclick="document.getElementById('del-card').style.display='none'">取消</button></h3>
+<p class="hint" id="del-warn" style="margin:8px 0"></p>
+<div class="row">
+<div><label>請輸入管理密碼以確認刪除</label><input id="del-pw" type="password" placeholder="管理密碼" style="width:220px" onkeydown="if(event.key==='Enter')confirmDelExam()"></div>
+<div><label>&nbsp;</label><button class="btn-r" onclick="confirmDelExam()">確認刪除</button></div>
+</div>
+<div class="info" id="del-info"></div><div class="err-box" id="del-err"></div>
+</div>
+
+<div class="card" id="panel-stu" style="display:none">
+<h3>學生名單 <span class="hint">(測試帳不列入排名)</span></h3><div id="stu-list" style="margin-top:8px"></div>
+<h3 style="margin-top:16px">新增 / 更新學生（帳號重複=更新，密碼留空=不改密碼）</h3><br>
+<div class="row">
+<div><label>帳號 *</label><input id="s-acc"></div><div><label>密碼</label><input id="s-pw" placeholder="新增時必填"></div>
+<div><label>座號 *</label><input id="s-seat" style="width:80px"></div><div><label>姓名 *</label><input id="s-name" style="width:120px"></div>
+<div><label>班級</label><input id="s-cls" value="1421" style="width:100px"></div>
+<div><label>測試帳</label><input id="s-exc" type="checkbox" style="width:20px;height:20px"></div>
+<div><label>&nbsp;</label><button class="btn-p" onclick="upsertStudent()">儲存</button></div>
+</div>
+<div class="info" id="stu-info"></div>
+</div>
+
+<div class="card" id="panel-audit" style="display:none">
+<h3>操作紀錄 <span class="hint">(最近 200 筆)</span></h3><br>
+<div class="row"><div><label>&nbsp;</label><button class="btn-p" onclick="loadAudit()">載入紀錄</button></div></div>
+<div class="info" id="audit-info"></div>
+<div style="overflow-x:auto"><table class="sub" style="margin-top:8px"><thead><tr><th>時間</th><th>老師</th><th>動作</th><th>明細</th></tr></thead><tbody id="audit-tb"></tbody></table></div>
+</div>
+
+<div class="card" id="panel-pw" style="display:none;border:2px dashed #66bb6a">
+<h3>變更管理密碼 <button class="btn-g btn-s" style="float:right" onclick="togglePw(false)">關閉</button></h3><br>
+<div class="row">
+<div><label>舊密碼</label><input id="pw-old" type="password"></div>
+<div><label>新密碼 (至少6碼)</label><input id="pw-new" type="password"></div>
+<div><label>確認新密碼</label><input id="pw-new2" type="password"></div>
+<div><label>&nbsp;</label><button class="btn-p" onclick="changePassword()">變更密碼</button></div>
+</div>
+<div class="info" id="pw-info"></div><div class="err-box" id="pw-err"></div>
+</div>
+</div>
+<div id="modal-overlay" onclick="if(event.target===this)closeModal()">
+<div id="modal-box" class="ok">
+<div id="modal-icon"></div>
+<div id="modal-title"></div>
+<div id="modal-msg"></div>
+<button class="btn-p" style="min-width:120px" onclick="closeModal()">確定</button>
+</div>
+</div>
+</main>
+</div>`;
+}
+
+// ============================================================
+// 單頁版共用 script 基座（api＋視圖切換；兩邊共用一份）
+// ============================================================
+function appScriptShared(START, EXECURL) {
+  return `<script>
+var START_TEACHER = ${START};
+var EXEC_URL = '${jsStr(EXECURL)}';
+var CR = String.fromCharCode(13), LF = String.fromCharCode(10), TAB = String.fromCharCode(9);
+function api(action, params) {
+  return new Promise(function (resolve, reject) {
+    google.script.run
+      .withSuccessHandler(resolve)
+      .withFailureHandler(function (err) { reject(new Error((err && err.message) || String(err))); })
+      .apiCall(action, params || {});
+  });
+}
+async function gotoTeacher() {
+  document.getElementById('view-student').style.display = 'none';
+  document.getElementById('view-teacher').style.display = 'block';
+  window.scrollTo(0, 0);
+  if (document.getElementById('app').style.display === 'block') return;
+  var pw = T_PW;
+  if (!pw) { try { pw = sessionStorage.getItem('t_pw') || ''; } catch (e) {} }
+  if (!pw) return;
+  try {
+    var d = await api('teacher_login', { password: pw });
+    if (d.success) { T_PW = pw; enter(); }
+  } catch (e) {}
+}
+function gotoStudent() {
+  document.getElementById('view-teacher').style.display = 'none';
+  document.getElementById('view-student').style.display = 'block';
+  window.scrollTo(0, 0);
+}`;
+}
+
+// ============================================================
+// 單頁版：學生 JS（api/CR/LF/TAB 由共用基座提供）
+// ============================================================
+function appScriptStu(TITLE) {
+  return `
+var SYSTEM_TITLE = '${jsStr(TITLE)}';
+var curUser = null, lastSlip = null, lastTrend = null;
+function isNeutralStr(s) {
+  s = s || '';
+  var ks = ['排名', '名次', '總分', '平均', '進退步', '前名次'];
+  for (var i = 0; i < ks.length; i++) { if (s.indexOf(ks[i]) >= 0) return true; }
+  return false;
+}
+function fmtNum(v) {
+  if (v === null || v === undefined || v === '') return '—';
+  var n = Number(v);
+  if (!isFinite(n)) return String(v);
+  return String(Math.round(n * 100) / 100);
+}
+async function doLogin() {
+  var a = document.getElementById('username').value.trim();
+  var p = document.getElementById('password').value.trim();
+  var err = document.getElementById('login-error'), load = document.getElementById('login-loading');
+  err.style.display = 'none';
+  if (!a || !p) { err.textContent = '請輸入帳號密碼'; err.style.display = 'block'; return; }
+  load.style.display = 'block';
+  try {
+    var d = await api('login', { username: a, password: p });
+    if (d.success) { showScore(d.user, d.sheets || []); }
+    else { err.textContent = '❌ ' + (d.message || '登入失敗'); err.style.display = 'block'; }
+  } catch (e) { err.textContent = '⚠ ' + e.message; err.style.display = 'block'; }
+  load.style.display = 'none';
+}
+async function showScore(user, sheets) {
+  curUser = user;
+  document.getElementById('login-page').style.display = 'none';
+  document.getElementById('score-page').style.display = 'block';
+  document.getElementById('logout-btn').style.display = 'inline-block';
+  document.getElementById('seat').textContent = user.seat || '—';
+  document.getElementById('sname').textContent = user.name || user.username;
+  if (!sheets || !sheets.length) {
+    try { var r = await api('exams_list', {}); sheets = r.exams || []; } catch (e) { sheets = []; }
+  }
+  var sel = document.getElementById('exam-select');
+  sel.innerHTML = '<option value="">-- 請選擇 --</option>';
+  sheets.forEach(function (nm) {
+    var o = document.createElement('option'); o.value = nm; o.textContent = nm; sel.appendChild(o);
+  });
+  loadTrend();
+}
+async function loadClassStats(examName) {
+  var card = document.getElementById('stat-card');
+  try {
+    var d = await api('student_stats', { exam: examName });
+    if (!d.success || !(d.stats || []).length) { card.style.display = 'none'; return; }
+    document.getElementById('stat-table').innerHTML = classStatsHTML(d.stats);
+    card.style.display = 'block';
+  } catch (e) { card.style.display = 'none'; }
+}
+async function loadTrend() {
+  var card = document.getElementById('trend-card');
+  try {
+    var d = await api('student_trend', { username: curUser.username });
+    var all = d.trend || [];
+    lastTrend = all.filter(function (p) { return (p.average !== null && p.average !== undefined) || (p.rank !== null && p.rank !== undefined); });
+    if (!lastTrend.length) { card.style.display = 'none'; return; }
+    card.style.display = 'block';
+    drawTrend(lastTrend);
+  } catch (e) { card.style.display = 'none'; }
+}
+function drawTrend(pts) {
+  var cv = document.getElementById('trend-cv');
+  var pw = cv.parentElement.clientWidth || 640;
+  var W = Math.max(pw - 8, pts.length * 88 + 68, 280), H = 260, dpr = window.devicePixelRatio || 1;
+  cv.width = W * dpr; cv.height = H * dpr; cv.style.width = W + 'px'; cv.style.height = H + 'px';
+  var c = cv.getContext('2d'); c.setTransform(dpr, 0, 0, dpr, 0, 0); c.clearRect(0, 0, W, H);
+  var padL = 36, padR = 32, padT = 16, padB = 30;
+  var avgs = pts.map(function (p) { return p.average; }).filter(function (v) { return v !== null && v !== undefined; });
+  var ranks = pts.map(function (p) { return p.rank; }).filter(function (v) { return v !== null && v !== undefined; });
+  var aMin = avgs.length ? Math.min.apply(null, avgs) : 0;
+  var aMax = avgs.length ? Math.max.apply(null, avgs) : 100;
+  if (aMin === aMax) { aMin -= 5; aMax += 5; }
+  var rMax = ranks.length ? Math.max.apply(null, ranks.concat([1])) : 1;
+  var X = function (i) { return padL + (W - padL - padR) * (pts.length === 1 ? 0.5 : i / (pts.length - 1)); };
+  var YA = function (v) { return padT + (H - padT - padB) * (1 - (v - aMin) / (aMax - aMin)); };
+  var YR = function (v) { return padT + (H - padT - padB) * ((v - 1) / ((rMax - 1) || 1)); };
+  c.lineWidth = 1; c.font = '11px sans-serif';
+  for (var g = 0; g <= 4; g++) {
+    var y = padT + (H - padT - padB) * g / 4;
+    c.strokeStyle = '#cfe6d4'; c.beginPath(); c.moveTo(padL, y); c.lineTo(W - padR, y); c.stroke();
+    c.fillStyle = '#1565c0'; c.fillText((aMax - (aMax - aMin) * g / 4).toFixed(1), 2, y + 4);
+    c.fillStyle = '#d81b60'; c.fillText(String(Math.round(1 + (rMax - 1) * g / 4)), W - padR + 5, y + 4);
+  }
+  c.strokeStyle = '#1f3a2d'; c.lineWidth = 2;
+  c.beginPath(); c.moveTo(padL, padT - 6); c.lineTo(padL, H - padB); c.lineTo(W - padR + 6, H - padB); c.stroke();
+  c.beginPath(); c.moveTo(W - padR, padT - 6); c.lineTo(W - padR, H - padB); c.stroke();
+  pts.forEach(function (p, i) { var x = X(i); c.beginPath(); c.moveTo(x, H - padB); c.lineTo(x, H - padB + 5); c.stroke(); });
+  c.fillStyle = '#3d7a52';
+  pts.forEach(function (p, i) { c.fillText(String(p.exam_name || '').slice(0, 5), X(i) - 16, H - 10); });
+  c.font = 'bold 11px sans-serif';
+  if (avgs.length) { c.fillStyle = '#1565c0'; c.fillText('● 平均', padL + 6, padT + 2); }
+  if (ranks.length) { c.fillStyle = '#d81b60'; c.fillText('● 班名次', padL + 56, padT + 2); }
+  var line = function (key, Y, color) {
+    c.strokeStyle = color; c.lineWidth = 2.5; c.beginPath();
+    var started = false;
+    pts.forEach(function (p, i) {
+      var v = p[key];
+      if (v === null || v === undefined) return;
+      var x = X(i), y = Y(v);
+      if (!started) { c.moveTo(x, y); started = true; } else { c.lineTo(x, y); }
+    });
+    c.stroke(); c.fillStyle = color;
+    pts.forEach(function (p, i) {
+      var v = p[key];
+      if (v === null || v === undefined) return;
+      c.beginPath(); c.arc(X(i), Y(v), 3.5, 0, 7); c.fill();
+    });
+  };
+  if (avgs.length) line('average', YA, '#1565c0');
+  if (ranks.length) line('rank', YR, '#d81b60');
+}
+var lastRadar = null;
+function drawRadar(subs) {
+  var card = document.getElementById('radar-card');
+  var items = (subs || []).map(function (s) {
+    var raw = (s.score !== undefined && s.score !== null && s.score !== '') ? s.score : s.value;
+    var v = (raw === undefined || raw === null || raw === '') ? null : Number(raw);
+    return { name: s.name, value: (v === null || !isFinite(v)) ? null : v };
+  }).filter(function (o) { return o.value !== null; });
+  if (items.length < 3) { card.style.display = 'none'; lastRadar = null; return; }
+  lastRadar = items;
+  card.style.display = 'block';
+  var cv = document.getElementById('radar-cv');
+  var boxW = (cv.parentElement && cv.parentElement.clientWidth) || 600;
+  var S = Math.max(Math.min(boxW - 16, 460), 280);
+  var dpr = window.devicePixelRatio || 1;
+  cv.width = S * dpr; cv.height = S * dpr; cv.style.width = S + 'px'; cv.style.height = S + 'px';
+  var c = cv.getContext('2d'); c.setTransform(dpr, 0, 0, dpr, 0, 0); c.clearRect(0, 0, S, S);
+  var cx = S / 2, cy = S / 2 + 8, R = S / 2 - 46;
+  var n = items.length, i;
+  var ang = function (k) { return -Math.PI / 2 + k * 2 * Math.PI / n; };
+  var rr = function (v) { return R * Math.max(0, Math.min(100, v)) / 100; };
+  var PX = function (k, v) { return cx + rr(v) * Math.cos(ang(k)); };
+  var PY = function (k, v) { return cy + rr(v) * Math.sin(ang(k)); };
+  c.textAlign = 'center';
+  var rings = [20, 40, 60, 80, 100];
+  rings.forEach(function (rv) {
+    c.beginPath();
+    for (i = 0; i < n; i++) { if (i === 0) c.moveTo(PX(i, rv), PY(i, rv)); else c.lineTo(PX(i, rv), PY(i, rv)); }
+    c.closePath();
+    c.strokeStyle = rv === 100 ? '#66bb6a' : '#d7e8da';
+    c.lineWidth = rv === 100 ? 1.5 : 1;
+    c.stroke();
+    c.fillStyle = '#7da88c'; c.font = '10px sans-serif';
+    c.fillText(String(rv), cx + 4, cy - rr(rv) + 3);
+  });
+  for (i = 0; i < n; i++) {
+    c.beginPath(); c.moveTo(cx, cy); c.lineTo(PX(i, 100), PY(i, 100));
+    c.strokeStyle = '#d7e8da'; c.lineWidth = 1; c.stroke();
+  }
+  c.beginPath();
+  items.forEach(function (s, k) { if (k === 0) c.moveTo(PX(k, s.value), PY(k, s.value)); else c.lineTo(PX(k, s.value), PY(k, s.value)); });
+  c.closePath();
+  c.fillStyle = 'rgba(102,187,106,.28)'; c.fill();
+  c.strokeStyle = '#2e7d32'; c.lineWidth = 2; c.stroke();
+  c.font = '11px sans-serif';
+  items.forEach(function (s, k) {
+    var px = PX(k, s.value), py = PY(k, s.value);
+    c.beginPath(); c.arc(px, py, 3.5, 0, 7);
+    c.fillStyle = s.value < 60 ? '#d81b60' : '#2e7d32'; c.fill();
+    var lx = cx + (R + 18) * Math.cos(ang(k)), ly = cy + (R + 18) * Math.sin(ang(k));
+    c.fillStyle = '#1f3a2d';
+    c.fillText(String(s.name), lx, ly + 4);
+  });
+}
+window.addEventListener('resize', function () {
+  if (lastTrend && lastTrend.length && document.getElementById('trend-card').style.display !== 'none') drawTrend(lastTrend);
+  if (lastRadar && lastRadar.length && document.getElementById('radar-card').style.display !== 'none') drawRadar(lastRadar);
+});
+async function loadScores() {
+  var id = document.getElementById('exam-select').value;
+  var err = document.getElementById('score-error'), tb = document.getElementById('tbody');
+  err.style.display = 'none'; tb.innerHTML = '';
+  if (!id) {
+    document.getElementById('score-wrap').style.display = 'none';
+    document.getElementById('sum-wrap').style.display = 'none';
+    document.getElementById('radar-card').style.display = 'none';
+    lastRadar = null;
+    document.getElementById('stat-card').style.display = 'none';
+    document.getElementById('print-btn-row').style.display = 'none';
+    lastSlip = null; return;
+  }
+  document.getElementById('score-loading').style.display = 'block';
+  try {
+    var d = await api('student_scores', { username: curUser.username, exam: id });
+    if (!d.success) { err.textContent = '❌ ' + (d.message || '查無成績'); err.style.display = 'block'; lastRadar = null; document.getElementById('radar-card').style.display = 'none'; }
+    else {
+      document.getElementById('score-title').textContent = '📋 ' + d.exam;
+      var avgV = (d.official_average === null || d.official_average === undefined) ? d.average : d.official_average;
+      document.getElementById('avg').textContent = (avgV === null || avgV === undefined) ? '—' : fmtNum(avgV);
+      lastSlip = { exam_id: id, exam: d.exam, scores: d.scores, avg: (avgV === null || avgV === undefined) ? '—' : fmtNum(avgV) };
+      document.getElementById('print-btn-row').style.display = 'block';
+      loadClassStats(id);
+      (d.subjects || []).forEach(function (s) {
+        var tr = document.createElement('tr');
+        var v = (s.score === null || s.score === undefined || s.score === '') ? '—' : String(s.score);
+        var n = parseFloat(v);
+        var isNum = !isNaN(n) && v !== '—';
+        var td1 = document.createElement('td'); td1.textContent = s.name; tr.appendChild(td1);
+        var td2 = document.createElement('td');
+        var sp = document.createElement('span');
+        if (isNum) { sp.className = n >= 60 ? 'pass' : 'fail'; if (n < 60) tr.classList.add('fail-row'); }
+        sp.textContent = v; td2.appendChild(sp); tr.appendChild(td2);
+        var td3 = document.createElement('td');
+        td3.textContent = (s.rank === null || s.rank === undefined || s.rank === '') ? '—' : String(s.rank);
+        tr.appendChild(td3);
+        tb.appendChild(tr);
+      });
+      document.getElementById('score-wrap').style.display = 'block';
+      var stb = document.getElementById('sum-tbody'); stb.innerHTML = '';
+      (d.summary || []).forEach(function (s) {
+        var tr = document.createElement('tr');
+        var td1 = document.createElement('td'); td1.textContent = s.name; tr.appendChild(td1);
+        var td2 = document.createElement('td'); td2.textContent = fmtNum(s.value); tr.appendChild(td2);
+        stb.appendChild(tr);
+      });
+      document.getElementById('sum-wrap').style.display = (d.summary && d.summary.length) ? 'block' : 'none';
+      drawRadar(d.subjects);
+    }
+  } catch (e) { err.textContent = '⚠ ' + e.message; err.style.display = 'block'; }
+  document.getElementById('score-loading').style.display = 'none';
+}
+function logout() {
+  curUser = null; lastSlip = null; lastTrend = null; lastRadar = null;
+  document.getElementById('score-page').style.display = 'none';
+  document.getElementById('login-page').style.display = 'block';
+  document.getElementById('logout-btn').style.display = 'none';
+  document.getElementById('username').value = '';
+  document.getElementById('password').value = '';
+  document.getElementById('login-error').style.display = 'none';
+  document.getElementById('exam-select').innerHTML = '<option value="">-- 請選擇 --</option>';
+  document.getElementById('score-wrap').style.display = 'none';
+  document.getElementById('sum-wrap').style.display = 'none';
+  document.getElementById('stat-card').style.display = 'none';
+  document.getElementById('trend-card').style.display = 'none';
+  document.getElementById('radar-card').style.display = 'none';
+  document.getElementById('print-btn-row').style.display = 'none';
+  document.getElementById('tbody').innerHTML = '';
+  document.getElementById('seat').textContent = '—';
+  document.getElementById('sname').textContent = '—';
+  document.getElementById('avg').textContent = '—';
+  window.scrollTo(0, 0);
+}
+async function printSlip() {
+  if (!lastSlip || !curUser) { alert('請先選擇考試並載入成績'); return; }
+  var t = new Date();
+  var ds = t.getFullYear() + '/' + String(t.getMonth() + 1) + '/' + String(t.getDate());
+  var rows = '';
+  lastSlip.scores.forEach(function (s) {
+    var v = (s.score === null || s.score === undefined || s.score === '') ? '—' : String(s.score);
+    var n = parseFloat(v);
+    var isNum = !isNaN(n) && v !== '—';
+    var cls = '';
+    if (isNum && !isNeutralStr(s.subject || '')) cls = n >= 60 ? 'pass' : 'fail';
+    rows += '<tr><td class="sub">' + s.subject + '</td><td class="' + cls + '">' + v + '</td></tr>';
+  });
+  var statsHTML = '';
+  try {
+    var r = await api('student_stats', { exam: lastSlip.exam_id });
+    if (r.success && (r.stats || []).length) statsHTML = '<h3>全班統計</h3>' + classStatsHTML(r.stats);
+  } catch (e) {}
+  document.getElementById('print-slip').innerHTML =
+    '<h2>' + SYSTEM_TITLE + '個人成績單</h2><div class="sl-sub">' + lastSlip.exam + '　列印日期：' + ds + '</div>' +
+    '<div class="sl-info"><span>班級：' + (curUser.class_no || '') + '</span><span>座號：' + (curUser.seat || '') + '</span><span>姓名：' + (curUser.name || curUser.username || '') + '</span><span>平均：' + lastSlip.avg + '</span></div>' +
+    '<table class="scores"><thead><tr><th>科目</th><th>成績</th></tr></thead><tbody>' + rows + '</tbody></table>' +
+    statsHTML + trendSlipHTML() +
+    '<div class="sl-foot">※ 未滿 60 分以紅字標示。總分、平均、排名由系統自動計算。</div>';
+  window.open(EXEC_URL + '?print=slip&u=' + encodeURIComponent(curUser.username) + '&e=' + encodeURIComponent(lastSlip.exam_id), '_blank');
+}
+function classStatsHTML(rows) {
+  var h = '<table class="compact"><thead><tr><th>科目</th><th>人數</th><th>平均</th><th>最高</th><th>最低</th><th>及格率%</th><th>90+</th><th>80-89</th><th>70-79</th><th>60-69</th><th>&lt;60</th></tr></thead><tbody>';
+  rows.forEach(function (r) {
+    if (r.n) {
+      h += '<tr><td>' + r.name + '</td><td>' + r.n + '</td><td>' + r.avg + '</td><td>' + r.max + '</td><td>' + r.min + '</td><td>' + r.rate + '</td><td>' + r.g90 + '</td><td>' + r.g80 + '</td><td>' + r.g70 + '</td><td>' + r.g60 + '</td><td>' + r.g0 + '</td></tr>';
+    } else {
+      h += '<tr><td>' + r.name + '</td><td colspan="10">—</td></tr>';
+    }
+  });
+  return h + '</tbody></table>';
+}
+function trendSlipHTML() {
+  if (!lastTrend || !lastTrend.length) return '';
+  var tds = function (f) {
+    return lastTrend.map(function (p) {
+      var v = p[f];
+      return '<td>' + ((v === null || v === undefined) ? '—' : fmtNum(v)) + '</td>';
+    }).join('');
+  };
+  var ths = lastTrend.map(function (p) { return '<th>' + (p.exam_name || '') + '</th>'; }).join('');
+  var tab = '<table class="compact" style="margin-top:6px"><thead><tr><th></th>' + ths + '</tr></thead><tbody><tr><td>平均</td>' + tds('average') + '</tr><tr><td>班名次</td>' + tds('rank') + '</tr></tbody></table>';
+  return '<h3>歷次走勢</h3>' + trendSlipSVG() + tab;
+}
+function trendSlipSVG() {
+  var pts = (lastTrend || []).filter(function (p) { return (p.average !== null && p.average !== undefined) || (p.rank !== null && p.rank !== undefined); });
+  if (!pts.length) return '';
+  var W = 700, H = 300, padL = 56, padR = 48, padT = 20, padB = 48;
+  var avgs = pts.map(function (p) { return p.average; }).filter(function (v) { return v !== null && v !== undefined; });
+  var ranks = pts.map(function (p) { return p.rank; }).filter(function (v) { return v !== null && v !== undefined; });
+  var aMin = avgs.length ? Math.min.apply(null, avgs) : 0;
+  var aMax = avgs.length ? Math.max.apply(null, avgs) : 100;
+  if (aMin === aMax) { aMin -= 5; aMax += 5; }
+  var rMax = ranks.length ? Math.max.apply(null, ranks.concat([1])) : 1;
+  var X = function (i) { return padL + (W - padL - padR) * (pts.length === 1 ? 0.5 : i / (pts.length - 1)); };
+  var YA = function (v) { return padT + (H - padT - padB) * (1 - (v - aMin) / (aMax - aMin)); };
+  var YR = function (v) { return padT + (H - padT - padB) * ((v - 1) / ((rMax - 1) || 1)); };
+  var F = function (n) { return Math.round(Number(n) * 100) / 100; };
+  var s = '';
+  for (var g = 0; g <= 4; g++) {
+    var y = F(padT + (H - padT - padB) * g / 4);
+    s += '<line x1="' + padL + '" y1="' + y + '" x2="' + (W - padR) + '" y2="' + y + '" stroke="#cfe6d4"/>';
+    s += '<line x1="' + (padL - 6) + '" y1="' + y + '" x2="' + padL + '" y2="' + y + '" stroke="#1f3a2d" stroke-width="2"/>';
+    s += '<line x1="' + (W - padR) + '" y1="' + y + '" x2="' + (W - padR + 6) + '" y2="' + y + '" stroke="#1f3a2d" stroke-width="2"/>';
+    s += '<text x="2" y="' + F(y + 4) + '" font-size="12" fill="#1565c0">' + F(aMax - (aMax - aMin) * g / 4).toFixed(1) + '</text>';
+    s += '<text x="' + (W - padR + 9) + '" y="' + F(y + 4) + '" font-size="12" fill="#d81b60">' + Math.round(1 + (rMax - 1) * g / 4) + '</text>';
+  }
+  s += '<line x1="' + padL + '" y1="' + (padT - 8) + '" x2="' + padL + '" y2="' + (H - padB) + '" stroke="#1f3a2d" stroke-width="2"/>';
+  s += '<line x1="' + (W - padR) + '" y1="' + (padT - 8) + '" x2="' + (W - padR) + '" y2="' + (H - padB) + '" stroke="#1f3a2d" stroke-width="2"/>';
+  s += '<line x1="' + padL + '" y1="' + (H - padB) + '" x2="' + (W - padR + 8) + '" y2="' + (H - padB) + '" stroke="#1f3a2d" stroke-width="2"/>';
+  pts.forEach(function (p, i) {
+    var x = F(X(i));
+    s += '<line x1="' + x + '" y1="' + (H - padB) + '" x2="' + x + '" y2="' + (H - padB + 6) + '" stroke="#1f3a2d" stroke-width="2"/>';
+    s += '<text x="' + x + '" y="' + (H - padB + 24) + '" font-size="13" fill="#1f3a2d" text-anchor="middle">' + (p.exam_name || '') + '</text>';
+  });
+  s += '<text x="' + (padL + 8) + '" y="14" font-size="12" font-weight="bold" fill="#1565c0">● 平均</text>';
+  s += '<text x="' + (padL + 72) + '" y="14" font-size="12" font-weight="bold" fill="#d81b60">● 班名次</text>';
+  var path = function (key, Y, color) {
+    var dd = '', dots = '';
+    pts.forEach(function (p, i) {
+      var v = p[key];
+      if (v === null || v === undefined) return;
+      var x = F(X(i)), y = F(Y(v));
+      dd += (dd ? 'L' : 'M') + x + ' ' + y;
+      dots += '<circle cx="' + x + '" cy="' + y + '" r="4.5" fill="' + color + '"/>';
+    });
+    return dd ? '<path d="' + dd + '" fill="none" stroke="' + color + '" stroke-width="3"/>' + dots : '';
+  };
+  if (avgs.length) s += path('average', YA, '#1565c0');
+  if (ranks.length) s += path('rank', YR, '#d81b60');
+  return '<svg class="trend" viewBox="0 0 ' + W + ' ' + H + '" xmlns="http://www.w3.org/2000/svg">' + s + '</svg>';
+}
+(async function () {
+  try {
+    var d = await api('config_get_title', {});
+    if (d.success && d.title) {
+      SYSTEM_TITLE = d.title;
+      document.getElementById('sys-title').textContent = d.title;
+      document.title = d.title;
+    }
+  } catch (e) {}
+  if (START_TEACHER) gotoTeacher();
+})();`;
+}
+
+// ============================================================
+// 單頁版：老師 JS（logout→tLogout；logout-btn→t-logout-btn；stat-card→t-stat-card）
+// ============================================================
+function appScriptTea(TITLE) {
+  return `
+var T_PW = '';
+var G = { students: [], subjects: [], exam: null, _exams: [], _subs: [] };
+function tpw() { return { tpw: T_PW }; }
+function isDerivedStr(s) {
+  s = s || '';
+  var ks = ['排名', '名次', '總分', '平均', '進退步', '前名次'];
+  for (var i = 0; i < ks.length; i++) { if (s.indexOf(ks[i]) >= 0) return true; }
+  return false;
+}
+function isDerivedSub(sub) { return isDerivedStr(sub.code || '') || isDerivedStr(sub.name || ''); }
+function stripStar(name) {
+  name = String(name || '');
+  var i = name.lastIndexOf('*');
+  if (i > 0) {
+    var tail = name.substring(i + 1).trim();
+    if (tail !== '' && !isNaN(Number(tail))) return name.substring(0, i).trim();
+  }
+  return name;
+}
+function escQ(s) { return String(s == null ? '' : s).split('"').join('&quot;'); }
+function pad2(n) { n = String(n); return n.length >= 2 ? n : '0' + n; }
+function showTab(t) {
+  var ks = ['grade', 'exam', 'stu', 'audit'];
+  ks.forEach(function (k) {
+    document.getElementById('panel-' + k).style.display = k === t ? 'block' : 'none';
+    document.getElementById('tab-' + k).classList.toggle('on', k === t);
+  });
+  if (t === 'audit') loadAudit();
+}
+async function tLogin() {
+  var e = document.getElementById('login-err'); e.style.display = 'none';
+  var pw = document.getElementById('t-pw').value;
+  try {
+    var d = await api('teacher_login', { password: pw });
+    if (!d.success) { e.textContent = '❌ ' + (d.message || '登入失敗'); e.style.display = 'block'; return; }
+    T_PW = pw;
+    try { sessionStorage.setItem('t_pw', pw); } catch (se) {}
+    enter();
+  } catch (err) { e.textContent = '⚠ ' + err.message; err.style.display = 'block'; }
+}
+function tLogout() {
+  T_PW = '';
+  try { sessionStorage.removeItem('t_pw'); } catch (e) {}
+  G = { students: [], subjects: [], exam: null, _exams: [], _subs: [] };
+  delTarget = null;
+  document.getElementById('app').style.display = 'none';
+  document.getElementById('login-card').style.display = 'block';
+  document.getElementById('t-logout-btn').style.display = 'none';
+  document.getElementById('pw-btn').style.display = 'none';
+  document.getElementById('t-pw').value = '';
+  document.getElementById('login-err').style.display = 'none';
+  document.getElementById('panel-pw').style.display = 'none';
+  window.scrollTo(0, 0);
+}
+function togglePw(show) {
+  var c = document.getElementById('panel-pw');
+  var vis = (show === undefined) ? (c.style.display === 'none') : !!show;
+  c.style.display = vis ? 'block' : 'none';
+  if (vis) c.scrollIntoView();
+}
+async function enter() {
+  document.getElementById('login-card').style.display = 'none';
+  document.getElementById('app').style.display = 'block';
+  document.getElementById('t-logout-btn').style.display = 'inline-block';
+  document.getElementById('pw-btn').style.display = 'inline-block';
+  await refreshExams(); await refreshSubs(); await refreshStudents(); await loadTitle();
+}
+async function refreshExams() {
+  var d = await api('exams_list', tpw());
+  var exams = d.exams || [];
+  G._exams = exams;
+  var sel = document.getElementById('exam-sel'), cp = document.getElementById('ex-copy');
+  sel.innerHTML = ''; cp.innerHTML = '<option value="">(不複製/空白)</option>';
+  exams.forEach(function (nm) {
+    var o = document.createElement('option'); o.value = nm; o.textContent = nm; sel.appendChild(o);
+    var c = document.createElement('option'); c.value = nm; c.textContent = nm; cp.appendChild(c);
+  });
+  var box = document.getElementById('exam-list');
+  box.innerHTML = '';
+  if (!exams.length) { box.textContent = '尚無考試'; return; }
+  exams.forEach(function (nm, i) {
+    var line = document.createElement('div');
+    line.style.marginBottom = '6px';
+    var b = document.createElement('span'); b.className = 'badge'; b.textContent = '📝 ' + nm; line.appendChild(b);
+    line.appendChild(document.createTextNode(' '));
+    var rn = document.createElement('button'); rn.className = 'btn-g btn-s'; rn.textContent = '✏️ 改名';
+    rn.onclick = (function (idx) { return function () { renameExamDlg(idx); }; })(i);
+    line.appendChild(rn);
+    line.appendChild(document.createTextNode(' '));
+    var del = document.createElement('button'); del.className = 'btn-r btn-s'; del.textContent = '🗑 刪';
+    del.onclick = (function (idx) { return function () { openDelExam(idx); }; })(i);
+    line.appendChild(del);
+    box.appendChild(line);
+  });
+  if (exams.length && !G.exam) G.exam = exams[0];
+  if (G.exam) sel.value = G.exam;
+}
+async function loadTitle() {
+  try {
+    var d = await api('config_get_title', {});
+    if (d.success) document.getElementById('sys-title-input').value = d.title || '';
+  } catch (e) {}
+}
+async function saveTitle() {
+  var info = document.getElementById('title-info');
+  var t = document.getElementById('sys-title-input').value.trim();
+  if (!t) { info.textContent = '❌ 標題不可空白'; return; }
+  info.textContent = '儲存中…';
+  try {
+    var d = await api('config_set_title', { tpw: T_PW, title: t });
+    info.textContent = d.success ? '✅ 標題已更新為「' + t + '」，重新整理頁面即生效' : '❌ ' + (d.message || '失敗');
+  } catch (e) { info.textContent = '⚠ ' + e.message; }
+}
+async function refreshSubs() {
+  var d = await api('subjects_list', {});
+  G._subs = d.subjects || [];
+  var t = document.getElementById('sub-table');
+  var html = '<table class="sub"><thead><tr><th>科目名稱 (*N=權重)</th><th>權重</th><th></th></tr></thead><tbody>';
+  G._subs.forEach(function (s, i) {
+    html += '<tr><td><input id="sn-' + i + '" value="' + escQ(s.name) + '" style="width:160px"></td><td><input id="sw-' + i + '" class="w" value="' + (s.weight == null ? 1 : s.weight) + '"></td><td><button class="btn-p btn-s" data-si="' + i + '" onclick="saveSubject(this.getAttribute(' + "'data-si'" + '))">儲存</button></td></tr>';
+  });
+  t.innerHTML = html + '</tbody></table>';
+}
+async function saveSubject(i) {
+  i = parseInt(i, 10);
+  var old = G._subs[i];
+  var name = document.getElementById('sn-' + i).value.trim();
+  var weight = document.getElementById('sw-' + i).value.trim();
+  var info = document.getElementById('sub-info');
+  try {
+    var d = await api('subject_edit', { tpw: T_PW, oldName: old.name, name: name, weight: weight });
+    info.textContent = d.success ? '✅ ' + d.name + ' 權重' + d.weight + '，已重算 ' + d.recalc.exams + ' 次考試 ' + d.recalc.cells + ' 格' : '❌ ' + (d.message || '失敗');
+  } catch (e) { info.textContent = '⚠ ' + e.message; return; }
+  await refreshSubs(); if (G.exam) loadGrid();
+}
+async function recalcCurrent() {
+  if (!G.exam) { alert('請先選考試'); return; }
+  try {
+    var d = await api('recalc', { tpw: T_PW, exam: G.exam });
+    alert(d.success ? '✅ 已重算 ' + d.recalc.cells + ' 格' : '❌ ' + (d.message || '失敗'));
+  } catch (e) { alert('⚠ ' + e.message); return; }
+  loadGrid();
+}
+async function recalcAll() {
+  if (!confirm('重算全部考試的總分/排名/進退步？')) return;
+  try {
+    var d = await api('recalc_all', { tpw: T_PW });
+    alert(d.success ? '✅ 已重算 ' + d.recalc.exams + ' 次考試 ' + d.recalc.cells + ' 格' : '❌ ' + (d.message || '失敗'));
+  } catch (e) { alert('⚠ ' + e.message); return; }
+  if (G.exam) loadGrid();
+}
+async function refreshStudents() {
+  var d = await api('students_list', tpw());
+  var list = d.students || [];
+  var html = '<span class="badge">共 ' + list.length + ' 人</span><table class="sub" style="margin-top:8px"><thead><tr><th>座號</th><th>姓名</th><th>帳號</th><th>狀態</th><th></th></tr></thead><tbody>';
+  list.forEach(function (s) {
+    html += '<tr><td style="text-align:center">' + s.seat + '</td><td>' + s.name + (s.excluded ? '<span class="test-badge">測</span>' : '') + '</td><td>' + s.account + '</td><td>' + (s.excluded ? '測試(不排名)' : '正式') + '</td><td><button class="btn-g btn-s" data-acc="' + escQ(s.account) + '" onclick="toggleExcluded(this.getAttribute(' + "'data-acc'" + '))">' + (s.excluded ? '轉正式' : '設測試') + '</button></td></tr>';
+  });
+  document.getElementById('stu-list').innerHTML = html + '</tbody></table>';
+  G._stuMap = {};
+  list.forEach(function (s) { G._stuMap[s.account] = s; });
+}
+async function changePassword() {
+  var info = document.getElementById('pw-info'), err = document.getElementById('pw-err');
+  info.textContent = ''; err.style.display = 'none';
+  var o = document.getElementById('pw-old').value, n = document.getElementById('pw-new').value, n2 = document.getElementById('pw-new2').value;
+  if (!o || !n) { err.textContent = '❌ 舊密碼與新密碼不可空白'; err.style.display = 'block'; return; }
+  if (n !== n2) { err.textContent = '❌ 兩次新密碼不一致'; err.style.display = 'block'; return; }
+  try {
+    var d = await api('teacher_change_password', { old_password: o, new_password: n });
+    if (!d.success) { err.textContent = '❌ ' + (d.message || '變更失敗'); err.style.display = 'block'; return; }
+    T_PW = n;
+    try { sessionStorage.setItem('t_pw', n); } catch (se) {}
+    info.textContent = '✅ 密碼已變更';
+    document.getElementById('pw-old').value = ''; document.getElementById('pw-new').value = ''; document.getElementById('pw-new2').value = '';
+  } catch (e) { err.textContent = '⚠ ' + e.message; err.style.display = 'block'; }
+}
+async function toggleExcluded(account) {
+  var s = (G._stuMap || {})[account];
+  if (!s) return;
+  var toEx = !s.excluded;
+  if (!confirm('確定將 ' + s.seat + ' ' + s.name + (toEx ? ' 設為測試帳(不排名)' : ' 轉為正式生') + '？')) return;
+  try {
+    var d = await api('student_upsert', { tpw: T_PW, account: s.account, password: '', seat: s.seat, name: s.name, class_no: s.class_no, excluded: toEx });
+    if (!d.success) { alert('❌ ' + (d.message || '失敗')); return; }
+  } catch (e) { alert('⚠ ' + e.message); return; }
+  await refreshStudents(); if (G.exam) loadGrid();
+}
+function showModal(title, msg, ok) {
+  var good = (ok === undefined) ? true : !!ok;
+  document.getElementById('modal-box').className = good ? 'ok' : 'err';
+  document.getElementById('modal-icon').textContent = good ? '✅' : '❌';
+  document.getElementById('modal-title').textContent = title;
+  document.getElementById('modal-msg').textContent = msg;
+  document.getElementById('modal-overlay').classList.add('show');
+}
+function closeModal() { document.getElementById('modal-overlay').classList.remove('show'); }
+async function createExam() {
+  var name = document.getElementById('ex-name').value.trim();
+  if (!name) { showModal('提醒', '請輸入考試名稱', false); return; }
+  var cp = document.getElementById('ex-copy').value || null;
+  try {
+    var d = await api('exam_create', { tpw: T_PW, name: name, copy_from: cp });
+    if (d.success) {
+      document.getElementById('exam-info').textContent = '✅ 已新增：' + name;
+      document.getElementById('ex-name').value = '';
+      await refreshExams();
+      var extra = d.prev_filled ? (LF + '已自動帶入上次班名次為前名次 ' + d.prev_filled + ' 人') : '';
+      showModal('✅ 新增考試成功', '「' + name + '」已建立' + extra, true);
+    } else {
+      document.getElementById('exam-info').textContent = '❌ ' + (d.message || '失敗');
+      showModal('❌ 新增失敗', d.message || '失敗', false);
+    }
+  } catch (e) { showModal('❌ 新增失敗', e.message, false); }
+}
+function renameExamDlg(i) {
+  var old = G._exams[i];
+  var n = prompt('將考試「' + old + '」改名為：', old);
+  if (n === null) return;
+  n = n.trim();
+  if (!n || n === old) return;
+  api('exam_rename', { tpw: T_PW, oldName: old, newName: n }).then(function (d) {
+    if (!d.success) { alert('❌ ' + (d.message || '改名失敗')); return; }
+    if (G.exam === old) G.exam = n;
+    refreshExams();
+    showModal('✅ 改名成功', '「' + old + '」→「' + n + '」', true);
+  }).catch(function (e) { alert('⚠ ' + e.message); });
+}
+var delTarget = null;
+function openDelExam(i) {
+  delTarget = G._exams[i];
+  document.getElementById('del-warn').textContent = '確定刪除「' + delTarget + '」嗎？該次全班成績會一併刪除，此動作無法復原。';
+  document.getElementById('del-pw').value = '';
+  document.getElementById('del-info').textContent = '';
+  document.getElementById('del-err').style.display = 'none';
+  document.getElementById('del-card').style.display = 'block';
+  document.getElementById('del-pw').focus();
+}
+async function confirmDelExam() {
+  if (!delTarget) return;
+  var pw = document.getElementById('del-pw').value;
+  var err = document.getElementById('del-err'), info = document.getElementById('del-info');
+  err.style.display = 'none'; info.textContent = '';
+  if (!pw) { err.textContent = '❌ 請輸入管理密碼'; err.style.display = 'block'; return; }
+  try {
+    var d = await api('exam_delete', { tpw: T_PW, name: delTarget, password: pw });
+    if (!d.success) { err.textContent = '❌ ' + (d.message || '刪除失敗'); err.style.display = 'block'; return; }
+    info.textContent = '✅ 已刪除「' + delTarget + '」';
+    var delName = delTarget;
+    document.getElementById('del-card').style.display = 'none';
+    delTarget = null;
+    G.exam = null;
+    await refreshExams(); await refreshSubs();
+    if (G.exam) loadGrid();
+    else { document.getElementById('gh').innerHTML = ''; document.getElementById('gb').innerHTML = ''; document.getElementById('grid-info').textContent = ''; document.getElementById('t-stat-card').style.display = 'none'; }
+    showModal('✅ 刪除成功', '「' + delName + '」及其全班成績已刪除', true);
+  } catch (e) { err.textContent = '⚠ ' + e.message; err.style.display = 'block'; }
+}
+async function createSubject() {
+  var name = document.getElementById('sub-name').value.trim();
+  var weight = document.getElementById('sub-weight').value.trim();
+  if (!name) { alert('名稱必填'); return; }
+  try {
+    var d = await api('subject_create', { tpw: T_PW, code: name, name: name, weight: weight });
+    alert(d.success ? '✅ 新增科目：' + d.subject : '❌ ' + (d.message || '失敗'));
+  } catch (e) { alert('⚠ ' + e.message); return; }
+  await refreshSubs();
+}
+async function upsertStudent() {
+  var body = { tpw: T_PW, account: document.getElementById('s-acc').value.trim(), password: document.getElementById('s-pw').value, seat: document.getElementById('s-seat').value.trim(), name: document.getElementById('s-name').value.trim(), class_no: document.getElementById('s-cls').value.trim(), excluded: document.getElementById('s-exc').checked };
+  try {
+    var d = await api('student_upsert', body);
+    document.getElementById('stu-info').textContent = d.success ? '✅ 已儲存' : '❌ ' + (d.message || '失敗');
+  } catch (e) { document.getElementById('stu-info').textContent = '⚠ ' + e.message; return; }
+  await refreshStudents();
+}
+async function loadGrid() {
+  var id = document.getElementById('exam-sel').value;
+  if (!id) return;
+  G.exam = id;
+  var d;
+  try { d = await api('grid', { exam: G.exam }); }
+  catch (e) { document.getElementById('grid-info').textContent = '❌ ' + e.message; return; }
+  if (!d.success) { document.getElementById('grid-info').textContent = '❌ ' + (d.message || '載入失敗'); return; }
+  G.students = d.students; G.subjects = d.subjects; G.map = d.scores;
+  var gh = document.getElementById('gh'), gb = document.getElementById('gb');
+  gh.innerHTML = ''; gb.innerHTML = '';
+  var hr = document.createElement('tr');
+  var heads = ['座號', '姓名'].concat(d.subjects.map(function (s) { return s.name; }));
+  heads.forEach(function (t) { var th = document.createElement('th'); th.textContent = t; hr.appendChild(th); });
+  gh.appendChild(hr);
+  d.students.forEach(function (st, ri) {
+    var tr = document.createElement('tr');
+    if (st.excluded) tr.className = 'test-row';
+    var td0 = document.createElement('td'); td0.className = 'ro'; td0.textContent = st.seat; tr.appendChild(td0);
+    var td1 = document.createElement('td'); td1.className = 'ro'; td1.style.textAlign = 'left';
+    td1.textContent = st.name + (st.excluded ? '（測）' : ''); tr.appendChild(td1);
+    d.subjects.forEach(function (sub, ci) {
+      var td = document.createElement('td'); td.className = 'c';
+      var inp = document.createElement('input'); inp.className = 'cell'; inp.inputMode = 'decimal';
+      var v = G.map[st.id + '_' + sub.id];
+      inp.value = (v === null || v === undefined || v === '') ? '' : v;
+      inp.dataset.ri = ri; inp.dataset.ci = ci; inp.dataset.stu = st.id; inp.dataset.sub = sub.id;
+      if (isDerivedSub(sub)) { inp.classList.add('auto'); inp.disabled = true; inp.title = '自動計算欄'; inp.dataset.derived = '1'; }
+      else {
+        inp.addEventListener('change', function () { saveCell(inp); });
+        inp.addEventListener('paste', function (e) { gridPaste(e, inp); });
+      }
+      td.appendChild(inp); tr.appendChild(td);
+    });
+    gb.appendChild(tr);
+  });
+  document.getElementById('grid-info').textContent = '✅ ' + d.students.length + ' 人 × ' + d.subjects.length + ' 科 · 單格改完自動存 · 可整表貼上';
+  renderStats();
+}
+async function saveCell(inp) {
+  var val = inp.value.trim();
+  if (val !== '' && isNaN(Number(val))) { inp.classList.add('err'); alert('請輸入數字，空白=未輸入'); return; }
+  inp.classList.remove('err'); inp.classList.add('saving');
+  try {
+    var d = await api('score_set', { tpw: T_PW, exam: G.exam, student_id: inp.dataset.stu, subject_id: inp.dataset.sub, score: val === '' ? null : Number(val) });
+    if (!d.success) throw new Error(d.message || '儲存失敗');
+    inp.classList.remove('saving'); inp.classList.add('saved');
+    setTimeout(function () { inp.classList.remove('saved'); }, 1200);
+    await refreshDerived();
+  } catch (e) { inp.classList.remove('saving'); inp.classList.add('err'); alert('❌ ' + e.message); }
+}
+async function refreshDerived() {
+  try {
+    var d = await api('grid', { exam: G.exam });
+    if (!d.success) return;
+    G.map = d.scores;
+    var cur = (d.subjects || []).map(function (s) { return s.id + ':' + s.name; }).join('|');
+    var old = G.subjects.map(function (s) { return s.id + ':' + s.name; }).join('|');
+    if (cur !== old) { loadGrid(); return; }
+    var inps = document.querySelectorAll('#gb input[data-derived="1"]');
+    inps.forEach(function (inp) {
+      var v = G.map[inp.dataset.stu + '_' + inp.dataset.sub];
+      inp.value = (v === null || v === undefined || v === '') ? '' : v;
+      inp.classList.add('saved');
+      setTimeout(function () { inp.classList.remove('saved'); }, 800);
+    });
+  } catch (e) {}
+}
+async function gridPaste(e, origin) {
+  var text = (e.clipboardData || window.clipboardData).getData('text');
+  if (!text || (text.indexOf(TAB) < 0 && text.indexOf(LF) < 0 && text.indexOf(CR) < 0)) return;
+  e.preventDefault();
+  var flat = text.split(CR).join(LF);
+  var rows = flat.split(LF).filter(function (r) { return r.length; });
+  var matrix = rows.map(function (r) { return r.split(TAB); });
+  var ri0 = parseInt(origin.dataset.ri, 10), ci0 = parseInt(origin.dataset.ci, 10);
+  var cells = [];
+  matrix.forEach(function (row, di) {
+    row.forEach(function (val, dj) {
+      var ri = ri0 + di, ci = ci0 + dj;
+      if (ri >= G.students.length || ci >= G.subjects.length) return;
+      if (isDerivedSub(G.subjects[ci])) return;
+      var v = String(val).trim();
+      if (v === '') return;
+      cells.push({ ri: ri, ci: ci, stu: G.students[ri].id, sub: G.subjects[ci].id, score: v });
+    });
+  });
+  if (!cells.length) return;
+  if (!confirm('要貼上 ' + cells.length + ' 格嗎？')) return;
+  var gb = document.getElementById('gb');
+  cells.forEach(function (c) {
+    var inp = gb.rows[c.ri].cells[c.ci + 2].querySelector('input');
+    if (inp) inp.value = c.score;
+  });
+  var payload = { tpw: T_PW, exam: G.exam, cells: cells.map(function (c) { return { student_id: c.stu, subject_id: c.sub, score: isNaN(Number(c.score)) ? c.score : Number(c.score) }; }) };
+  try {
+    var d = await api('score_bulk', payload);
+    var msg = d.success ? ('✅ 已寫入 ' + d.updated + ' 格') : ('❌ ' + (d.message || '失敗'));
+    if (d.errors && d.errors.length) msg += LF + '錯誤：' + LF + d.errors.join(LF);
+    alert(msg);
+  } catch (err) { alert('⚠ ' + err.message); }
+  loadGrid();
+}
+function openBulk() { document.getElementById('bulk-card').style.display = 'none'; document.getElementById('single-card').style.display = 'none'; document.getElementById('bulk-card').style.display = 'block'; }
+function openSingle() {
+  if (!G.subjects || !G.subjects.length) { alert('請先載入考試'); return; }
+  var sel = document.getElementById('single-sub'); sel.innerHTML = '';
+  G.subjects.filter(function (s) { return !isDerivedSub(s); }).forEach(function (s) {
+    var o = document.createElement('option'); o.value = s.id; o.textContent = s.name; sel.appendChild(o);
+  });
+  document.getElementById('bulk-card').style.display = 'none';
+  document.getElementById('single-card').style.display = 'block';
+  document.getElementById('single').focus();
+}
+async function applySingle() {
+  var info = document.getElementById('single-info'), err = document.getElementById('single-err');
+  info.textContent = ''; err.style.display = 'none';
+  var subId = document.getElementById('single-sub').value;
+  if (!subId) { err.textContent = '❌ 請先選擇科目'; err.style.display = 'block'; return; }
+  var lines = document.getElementById('single').value.split(CR).join(LF).split(LF);
+  var cells = [], skipped = 0;
+  lines.forEach(function (raw, i) {
+    var v = String(raw).trim().split(TAB)[0].trim();
+    if (v === '') { skipped++; return; }
+    if (i >= G.students.length) return;
+    cells.push({ student_id: G.students[i].id, subject_id: subId, score: isNaN(Number(v)) ? v : Number(v) });
+  });
+  if (!cells.length) { err.textContent = '❌ 沒有可填入的分數'; err.style.display = 'block'; return; }
+  var subName = '';
+  G.subjects.forEach(function (s) { if (String(s.id) === String(subId)) subName = s.name; });
+  if (!confirm('將 ' + cells.length + ' 筆分數填入「' + subName + '」（座號順序）？')) return;
+  info.textContent = '寫入中…';
+  try {
+    var d = await api('score_bulk', { tpw: T_PW, exam: G.exam, cells: cells });
+    if (!d.success) { err.textContent = '❌ ' + (d.message || '失敗'); err.style.display = 'block'; return; }
+    info.textContent = '✅ 已填入 ' + d.updated + ' 格（已即時重算）';
+    document.getElementById('single').value = '';
+    loadGrid();
+  } catch (e) { err.textContent = '⚠ ' + e.message; err.style.display = 'block'; }
+}
+async function applyBulk() {
+  var info = document.getElementById('bulk-info'), err = document.getElementById('bulk-err');
+  info.textContent = ''; err.style.display = 'none';
+  var raw = document.getElementById('bulk').value.split(CR).join('').trim();
+  if (!raw) { err.textContent = '請先貼上內容'; err.style.display = 'block'; return; }
+  var lines = raw.split(LF).map(function (l) { return l.split(TAB).map(function (c) { return String(c).trim(); }); });
+  var header = lines[0];
+  var seatIdx = -1, nameIdx = -1;
+  header.forEach(function (h, i) {
+    if (seatIdx < 0 && (h.indexOf('座號') >= 0 || h === '座' || h.toLowerCase() === 'seat')) seatIdx = i;
+    if (nameIdx < 0 && (h.indexOf('姓名') >= 0 || h.indexOf('名字') >= 0 || h.toLowerCase() === 'name')) nameIdx = i;
+  });
+  if (seatIdx < 0) seatIdx = 0;
+  var subByName = {};
+  (G._subs || []).forEach(function (s) { subByName[s.name] = s.id; subByName[s.code] = s.id; });
+  var subById = {};
+  (G._subs || []).forEach(function (s) { subById[s.id] = s; });
+  var colSub = [];
+  header.forEach(function (h, ci) {
+    if (ci === seatIdx || ci === nameIdx) return;
+    if (subByName[h] && !isDerivedSub(subById[subByName[h]])) colSub.push({ ci: ci, sid: subByName[h], name: h });
+  });
+  if (!colSub.length) { err.textContent = '❌ 表頭找不到對應科目。系統科目：' + (G._subs || []).map(function (s) { return s.name; }).join('、'); err.style.display = 'block'; return; }
+  var seatMap = {};
+  G.students.forEach(function (s) { seatMap[String(s.seat).trim()] = s.id; });
+  var rows = [], warn = '';
+  for (var i = 1; i < lines.length; i++) {
+    var cols = lines[i];
+    if (!cols.length) continue;
+    var seat = String(cols[seatIdx] || '').trim();
+    if (!seat) continue;
+    var sid = seatMap[seat];
+    if (!sid) { warn += '⚠ 第' + (i + 1) + '列座號 ' + seat + ' 不在名單，略過' + LF; continue; }
+    var scores = {};
+    colSub.forEach(function (cs) {
+      var v = String(cols[cs.ci] || '').trim();
+      if (v !== '') scores[cs.sid] = v;
+    });
+    rows.push({ student_id: sid, scores: scores });
+  }
+  if (!rows.length) { err.textContent = '❌ 無有效列'; err.style.display = 'block'; return; }
+  info.textContent = '辨識 ' + rows.length + ' 人 × ' + colSub.length + ' 科，寫入中…';
+  try {
+    var d = await api('score_bulk', { tpw: T_PW, exam: G.exam, rows: rows });
+    if (!d.success) { err.textContent = '❌ ' + (d.message || '失敗'); err.style.display = 'block'; return; }
+    info.textContent = warn + '✅ 已寫入 ' + d.updated + ' 格';
+    loadGrid();
+  } catch (e) { err.textContent = '⚠ ' + e.message; err.style.display = 'block'; }
+}
+function buildStats() {
+  var pure = G.subjects.filter(function (s) { return !isDerivedSub(s); });
+  var kids = G.students.filter(function (st) { return !st.excluded; });
+  return pure.map(function (sub) {
+    var vals = kids.map(function (st) { return G.map[st.id + '_' + sub.id]; }).filter(function (v) { return v !== null && v !== undefined && v !== '' && !isNaN(Number(v)); }).map(Number);
+    if (!vals.length) return { name: stripStar(sub.name), n: 0 };
+    var pass = vals.filter(function (v) { return v >= 60; }).length;
+    var sum = vals.reduce(function (a, b) { return a + b; }, 0);
+    return { name: stripStar(sub.name), n: vals.length, avg: Math.round(sum / vals.length * 100) / 100, max: Math.max.apply(null, vals), min: Math.min.apply(null, vals), rate: Math.round(pass / vals.length * 1000) / 10, g90: vals.filter(function (v) { return v >= 90; }).length, g80: vals.filter(function (v) { return v >= 80 && v < 90; }).length, g70: vals.filter(function (v) { return v >= 70 && v < 80; }).length, g60: vals.filter(function (v) { return v >= 60 && v < 70; }).length, g0: vals.filter(function (v) { return v < 60; }).length };
+  });
+}
+function statsTableHTML(rows) {
+  if (!rows.length) return '（無純科目）';
+  var h = '<table class="sub"><thead><tr><th>科目</th><th>人數</th><th>平均</th><th>最高</th><th>最低</th><th>及格率%</th><th>90+</th><th>80-89</th><th>70-79</th><th>60-69</th><th>&lt;60</th></tr></thead><tbody>';
+  rows.forEach(function (r) {
+    if (r.n) h += '<tr><td>' + r.name + '</td><td style="text-align:center">' + r.n + '</td><td style="text-align:center">' + r.avg + '</td><td style="text-align:center">' + r.max + '</td><td style="text-align:center">' + r.min + '</td><td style="text-align:center">' + r.rate + '</td><td style="text-align:center">' + r.g90 + '</td><td style="text-align:center">' + r.g80 + '</td><td style="text-align:center">' + r.g70 + '</td><td style="text-align:center">' + r.g60 + '</td><td style="text-align:center">' + r.g0 + '</td></tr>';
+    else h += '<tr><td>' + r.name + '</td><td colspan="10" style="text-align:center">—</td></tr>';
+  });
+  return h + '</tbody></table>';
+}
+function renderStats() {
+  var box = document.getElementById('t-stat-card');
+  if (!G.subjects.length) { box.style.display = 'none'; box.innerHTML = ''; return; }
+  box.innerHTML = '<h3>全班統計</h3><div style="margin-top:8px;overflow-x:auto">' + statsTableHTML(buildStats()) + '</div>';
+  box.style.display = 'block';
+}
+function csvEsc(v) {
+  v = (v === null || v === undefined) ? '' : String(v);
+  if (v.indexOf(',') >= 0 || v.indexOf('"') >= 0 || v.indexOf(LF) >= 0 || v.indexOf(CR) >= 0) return '"' + v.split('"').join('""') + '"';
+  return v;
+}
+function exportCSV() {
+  if (!G.exam || !G.students.length || !G.subjects.length) { alert('請先選擇考試並按載入'); return; }
+  var sel = document.getElementById('exam-sel');
+  var examName = (sel.selectedOptions && sel.selectedOptions[0] ? sel.selectedOptions[0].textContent : '') || 'exam';
+  var lines = [];
+  lines.push(['座號', '姓名'].concat(G.subjects.map(function (s) { return String(s.name || ''); })).map(csvEsc).join(','));
+  G.students.forEach(function (st) {
+    var row = [st.seat == null ? '' : st.seat, (st.name || '') + (st.excluded ? ' (測試)' : '')];
+    G.subjects.forEach(function (sub) {
+      var v = G.map[st.id + '_' + sub.id];
+      row.push(v === null || v === undefined ? '' : v);
+    });
+    lines.push(row.map(csvEsc).join(','));
+  });
+  var blob = new Blob([String.fromCharCode(65279) + lines.join(String.fromCharCode(13, 10))], { type: 'text/csv;charset=utf-8' });
+  var a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = examName + '_總表.csv';
+  document.body.appendChild(a); a.click();
+  setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+}
+async function loadAudit() {
+  var info = document.getElementById('audit-info'), tb = document.getElementById('audit-tb');
+  info.textContent = '載入中…'; tb.innerHTML = '';
+  try {
+    var d = await api('audit_list', { tpw: T_PW, limit: 200 });
+    if (!d.success) { info.textContent = '❌ ' + (d.message || '載入失敗'); return; }
+    info.textContent = '共 ' + d.logs.length + ' 筆（最近 200）';
+    var html = '';
+    d.logs.forEach(function (l) {
+      var t = new Date(l.created_at * 1000);
+      var ts = t.getFullYear() + '/' + pad2(t.getMonth() + 1) + '/' + pad2(t.getDate()) + ' ' + pad2(t.getHours()) + ':' + pad2(t.getMinutes());
+      html += '<tr><td style="white-space:nowrap">' + ts + '</td><td>' + (l.teacher || '') + '</td><td>' + l.action + '</td><td style="word-break:break-all">' + (l.detail || '') + '</td></tr>';
+    });
+    tb.innerHTML = html || '<tr><td colspan="4" style="text-align:center">尚無紀錄</td></tr>';
+  } catch (e) { info.textContent = '⚠ ' + e.message; }
+}
+function printSlips() {
+  if (!G.exam) { alert('請先選擇考試並按載入'); return; }
+  window.open(EXEC_URL + '?print=slips&e=' + encodeURIComponent(G.exam) + '&pw=' + encodeURIComponent(T_PW), '_blank');
+}
+function printReport() {
+  if (!G.exam || !G.students.length || !G.subjects.length) { alert('請先選擇考試並按載入'); return; }
+  var sel = document.getElementById('exam-sel');
+  var examName = (sel.selectedOptions && sel.selectedOptions[0] ? sel.selectedOptions[0].textContent : '') || '';
+  var t = new Date();
+  var ds = t.getFullYear() + '/' + pad2(t.getMonth() + 1) + '/' + pad2(t.getDate());
+  var isAvg = function (s) { return (s.code || '').indexOf('平均') >= 0 || (s.name || '').indexOf('平均') >= 0; };
+  var fmt = function (sub, v) {
+    if (v === null || v === undefined || v === '') return '';
+    if (isAvg(sub)) { var n = Number(v); return isFinite(n) ? (Math.round(n * 100) / 100) : v; }
+    return v;
+  };
+  var head = ['座號', '姓名'].concat(G.subjects.map(function (s) { return stripStar(String(s.name || '')); }));
+  var html = '<h2>${jsStr(TITLE)}總表 — ' + examName + '</h2><div class="rp-sub">列印日期：' + ds + '　共 ' + G.students.length + ' 人（未滿 60 分紅字標示）</div><table><thead><tr>';
+  head.forEach(function (h) { html += '<th>' + h + '</th>'; });
+  html += '</tr></thead><tbody>';
+  G.students.forEach(function (st) {
+    html += '<tr' + (st.excluded ? ' class="test"' : '') + '><td>' + (st.seat == null ? '' : st.seat) + '</td><td class="name">' + (st.name || '') + (st.excluded ? '（測）' : '') + '</td>';
+    G.subjects.forEach(function (sub) {
+      var v = G.map[st.id + '_' + sub.id];
+      var fail = !isDerivedSub(sub) && !isAvg(sub) && v !== null && v !== undefined && v !== '' && Number(v) < 60;
+      html += '<td' + (fail ? ' class="fail"' : '') + '>' + fmt(sub, v) + '</td>';
+    });
+    html += '</tr>';
+  });
+  html += '</tbody></table>';
+  var stats = buildStats();
+  if (stats.length) html += '<h3>全班統計</h3>' + statsTableHTML(stats);
+  html += '<div class="rp-foot">※ 總分、平均、排名、前名次、進退步由系統自動計算。</div>';
+  document.getElementById('print-area').innerHTML = html;
+  window.open(EXEC_URL + '?print=report&e=' + encodeURIComponent(G.exam) + '&pw=' + encodeURIComponent(T_PW), '_blank');
+}
+`;
+}
+
+// ============================================================
+// 單頁版組裝
+// ============================================================
+function getAppHTML(startTeacher) {
+  var t = getSystemTitle();
+  return appHead(t)
+    + '<body>'
+    + appStudentView(t)
+    + appTeacherView()
+    + appScriptShared(startTeacher ? 'true' : 'false', ScriptApp.getService().getUrl())
+    + appScriptStu(t)
+    + appScriptTea(t)
+    + '</script><div id="print-slip"></div><div id="print-area"></div></body></html>';
+}
+
+// ============================================================
+// 列印專用頁（新分頁開啟：頂層文件＋onload 自動列印，不受嵌入 iframe 影響）
+// ============================================================
+function escHtml(s) {
+  return String(s == null ? '' : s).split('&').join('&amp;').split('<').join('&lt;').split('>').join('&gt;').split('"').join('&quot;');
+}
+
+// 伺服器字串注入前端 JS 單引號字串時的安全跳脫（引號/反斜線/換行/<\/script>）
+function jsStr(s) {
+  return String(s == null ? '' : s).replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, '\\n').replace(/\r/g, '').replace(/<\//g, '<\\/');
+}
+
+function fmt2(v) {
+  if (v === null || v === undefined || v === '') return '—';
+  var n = Number(v);
+  if (!isFinite(n)) return String(v);
+  return String(Math.round(n * 100) / 100);
+}
+
+function statsTableServer(rows) {
+  var h = '<table class="compact"><thead><tr><th>科目</th><th>人數</th><th>平均</th><th>最高</th><th>最低</th><th>及格率%</th><th>90+</th><th>80-89</th><th>70-79</th><th>60-69</th><th>&lt;60</th></tr></thead><tbody>';
+  rows.forEach(function (r) {
+    if (r.n) h += '<tr><td>' + escHtml(r.name) + '</td><td>' + r.n + '</td><td>' + r.avg + '</td><td>' + r.max + '</td><td>' + r.min + '</td><td>' + r.rate + '</td><td>' + r.g90 + '</td><td>' + r.g80 + '</td><td>' + r.g70 + '</td><td>' + r.g60 + '</td><td>' + r.g0 + '</td></tr>';
+    else h += '<tr><td>' + escHtml(r.name) + '</td><td colspan="10">—</td></tr>';
+  });
+  return h + '</tbody></table>';
+}
+
+function trendSVGServer(pts) {
+  var use = (pts || []).filter(function (p) { return (p.average !== null && p.average !== undefined) || (p.rank !== null && p.rank !== undefined); });
+  if (!use.length) return '';
+  var W = 700, H = 300, padL = 56, padR = 48, padT = 20, padB = 48;
+  var avgs = use.map(function (p) { return p.average; }).filter(function (v) { return v !== null && v !== undefined; });
+  var ranks = use.map(function (p) { return p.rank; }).filter(function (v) { return v !== null && v !== undefined; });
+  var aMin = avgs.length ? Math.min.apply(null, avgs) : 0;
+  var aMax = avgs.length ? Math.max.apply(null, avgs) : 100;
+  if (aMin === aMax) { aMin -= 5; aMax += 5; }
+  var rMax = ranks.length ? Math.max.apply(null, ranks.concat([1])) : 1;
+  var X = function (i) { return padL + (W - padL - padR) * (use.length === 1 ? 0.5 : i / (use.length - 1)); };
+  var YA = function (v) { return padT + (H - padT - padB) * (1 - (v - aMin) / (aMax - aMin)); };
+  var YR = function (v) { return padT + (H - padT - padB) * ((v - 1) / ((rMax - 1) || 1)); };
+  var F = function (n) { return Math.round(Number(n) * 100) / 100; };
+  var s = '';
+  for (var g = 0; g <= 4; g++) {
+    var y = F(padT + (H - padT - padB) * g / 4);
+    s += '<line x1="' + padL + '" y1="' + y + '" x2="' + (W - padR) + '" y2="' + y + '" stroke="#cfe6d4"/>';
+    s += '<line x1="' + (padL - 6) + '" y1="' + y + '" x2="' + padL + '" y2="' + y + '" stroke="#1f3a2d" stroke-width="2"/>';
+    s += '<line x1="' + (W - padR) + '" y1="' + y + '" x2="' + (W - padR + 6) + '" y2="' + y + '" stroke="#1f3a2d" stroke-width="2"/>';
+    s += '<text x="2" y="' + F(y + 4) + '" font-size="12" fill="#1565c0">' + F(aMax - (aMax - aMin) * g / 4).toFixed(1) + '</text>';
+    s += '<text x="' + (W - padR + 9) + '" y="' + F(y + 4) + '" font-size="12" fill="#d81b60">' + Math.round(1 + (rMax - 1) * g / 4) + '</text>';
+  }
+  s += '<line x1="' + padL + '" y1="' + (padT - 8) + '" x2="' + padL + '" y2="' + (H - padB) + '" stroke="#1f3a2d" stroke-width="2"/>';
+  s += '<line x1="' + (W - padR) + '" y1="' + (padT - 8) + '" x2="' + (W - padR) + '" y2="' + (H - padB) + '" stroke="#1f3a2d" stroke-width="2"/>';
+  s += '<line x1="' + padL + '" y1="' + (H - padB) + '" x2="' + (W - padR + 8) + '" y2="' + (H - padB) + '" stroke="#1f3a2d" stroke-width="2"/>';
+  use.forEach(function (p, i) {
+    var x = F(X(i));
+    s += '<line x1="' + x + '" y1="' + (H - padB) + '" x2="' + x + '" y2="' + (H - padB + 6) + '" stroke="#1f3a2d" stroke-width="2"/>';
+    s += '<text x="' + x + '" y="' + (H - padB + 24) + '" font-size="13" fill="#1f3a2d" text-anchor="middle">' + escHtml(p.exam_name || '') + '</text>';
+  });
+  s += '<text x="' + (padL + 8) + '" y="14" font-size="12" font-weight="bold" fill="#1565c0">● 平均</text>';
+  s += '<text x="' + (padL + 72) + '" y="14" font-size="12" font-weight="bold" fill="#d81b60">● 班名次</text>';
+  var path = function (key, Y, color) {
+    var dd = '', dots = '';
+    use.forEach(function (p, i) {
+      var v = p[key];
+      if (v === null || v === undefined) return;
+      var x = F(X(i)), y = F(Y(v));
+      dd += (dd ? 'L' : 'M') + x + ' ' + y;
+      dots += '<circle cx="' + x + '" cy="' + y + '" r="4.5" fill="' + color + '"/>';
+    });
+    return dd ? '<path d="' + dd + '" fill="none" stroke="' + color + '" stroke-width="3"/>' + dots : '';
+  };
+  if (avgs.length) s += path('average', YA, '#1565c0');
+  if (ranks.length) s += path('rank', YR, '#d81b60');
+  return '<svg class="trend" viewBox="0 0 ' + W + ' ' + H + '" xmlns="http://www.w3.org/2000/svg">' + s + '</svg>';
+}
+
+var SLIP_CSS = 'body{font-family:sans-serif;color:#000;margin:10mm}'
+  + 'h2{font-size:17px;text-align:center;margin-bottom:1px}'
+  + '.sl-sub{text-align:center;font-size:11px;margin-bottom:3px}'
+  + '.sl-info{display:flex;gap:24px;justify-content:center;font-size:12px;margin:6px 0;border-top:2px solid #333;border-bottom:1px solid #333;padding:4px 0}'
+  + 'table{border-collapse:collapse;width:100%;margin-top:4px}'
+  + 'th,td{border:1px solid #333;padding:5px 10px;font-size:13px;text-align:center}'
+  + 'table.scores th,table.scores td{font-size:10.5px;padding:2px 10px}'
+  + 'td.sub{text-align:left}td.fail{color:#c00;font-weight:900}td.pass{color:#1565c0;font-weight:700}'
+  + '.sl-foot{font-size:10px;margin-top:4px}h3{font-size:13px;text-align:center;margin:8px 0 3px}'
+  + 'svg.trend{width:100%;height:auto;display:block}'
+  + 'table.compact th,table.compact td{font-size:8.5px;padding:2px 2px}';
+
+var REPORT_CSS = 'body{font-family:sans-serif;color:#000;margin:8mm}'
+  + 'h2{font-size:18px;text-align:center;margin-bottom:2px}'
+  + '.rp-sub{text-align:center;font-size:11px;margin-bottom:6px}'
+  + 'table{border-collapse:collapse;width:100%;table-layout:fixed}'
+  + 'th,td{border:1px solid #333;padding:2px 3px;font-size:9.5px;text-align:center;white-space:nowrap;overflow:hidden}'
+  + 'th{background:#eee}td.name{text-align:left}td.fail{color:#c00;font-weight:900}tr.test td{background:#f0f0f0}'
+  + '.rp-foot{font-size:10px;margin-top:6px}h3{font-size:14px;text-align:center;margin:10px 0 4px}'
+  + 'table.compact th,table.compact td{font-size:8.5px;padding:2px 2px}';
+
+function printSlipPage(u, examName) {
+  var d = hStudentScores(u, examName);
+  if (!d.success) {
+    return HtmlService.createHtmlOutput('<body><p>' + escHtml(d.message) + '</p></body>').setTitle('列印失敗');
+  }
+  var me = { seat: '', name: String(u || ''), classNo: '' };
+  try {
+    var accs = readAccounts();
+    for (var i = 0; i < accs.length; i++) {
+      if (accs[i].account === String(u).trim()) { me = accs[i]; break; }
+    }
+  } catch (e) {}
+  var avgV = (d.official_average === null || d.official_average === undefined) ? d.average : d.official_average;
+  var subRows = '';
+  (d.subjects || []).forEach(function (s) {
+    var v = (s.score === null || s.score === undefined || s.score === '') ? '—' : String(s.score);
+    var n = parseFloat(v);
+    var isNum = !isNaN(n) && v !== '—';
+    var cls = '';
+    if (isNum) cls = n >= 60 ? 'pass' : 'fail';
+    var rk = (s.rank === null || s.rank === undefined || s.rank === '') ? '—' : String(s.rank);
+    subRows += '<tr><td class="sub">' + escHtml(s.name) + '</td><td class="' + cls + '">' + escHtml(v) + '</td><td>' + escHtml(rk) + '</td></tr>';
+  });
+  var sumRows = '';
+  (d.summary || []).forEach(function (s) {
+    sumRows += '<tr><td class="sub">' + escHtml(s.name) + '</td><td>' + escHtml(fmt2(s.value)) + '</td></tr>';
+  });
+  var statsHTML = '';
+  try {
+    var st = hStudentStats(examName);
+    if (st.success && (st.stats || []).length) statsHTML = '<h3>全班統計</h3>' + statsTableServer(st.stats);
+  } catch (e) {}
+  var trend = [];
+  try {
+    var tr = hStudentTrend(u);
+    trend = ((tr && tr.trend) || []).filter(function (p) { return p.average != null || p.rank != null; });
+  } catch (e) {}
+  var trendHTML = '';
+  if (trend.length) {
+    var ths = trend.map(function (p) { return '<th>' + escHtml(p.exam_name || '') + '</th>'; }).join('');
+    var tdsAvg = trend.map(function (p) { return '<td>' + fmt2(p.average) + '</td>'; }).join('');
+    var tdsRank = trend.map(function (p) { return '<td>' + fmt2(p.rank) + '</td>'; }).join('');
+    trendHTML = '<h3>歷次走勢</h3>' + trendSVGServer(trend)
+      + '<table class="compact" style="margin-top:6px"><thead><tr><th></th>' + ths + '</tr></thead><tbody><tr><td>平均</td>' + tdsAvg + '</tr><tr><td>班名次</td>' + tdsRank + '</tr></tbody></table>';
+  }
+  var t = new Date();
+  var ds = t.getFullYear() + '/' + (t.getMonth() + 1) + '/' + t.getDate();
+  var title = getSystemTitle();
+  var html = '<!DOCTYPE html><html lang="zh-TW"><head><meta charset="UTF-8"><title>個人成績單</title>'
+    + '<style>' + SLIP_CSS + '</style></head><body onload="window.print()">'
+    + '<h2>' + escHtml(title) + '個人成績單</h2>'
+    + '<div class="sl-sub">' + escHtml(d.exam) + '　列印日期：' + ds + '</div>'
+    + '<div class="sl-info"><span>班級：' + escHtml(me.classNo || '') + '</span><span>座號：' + escHtml(me.seat || '') + '</span><span>姓名：' + escHtml(me.name || '') + '</span><span>平均：' + fmt2(avgV) + '</span></div>'
+    + '<table class="scores"><thead><tr><th>科目</th><th>分數</th><th>排名</th></tr></thead><tbody>' + subRows + '</tbody></table>'
+    + '<h3>總分與名次</h3><table class="scores"><thead><tr><th>項目</th><th>內容</th></tr></thead><tbody>' + sumRows + '</tbody></table>'
+    + statsHTML + trendHTML
+    + '<div class="sl-foot">※ 未滿 60 分以紅字標示。總分、平均、排名由系統自動計算。</div>'
+    + '</body></html>';
+  return HtmlService.createHtmlOutput(html).setTitle('個人成績單');
+}
+
+function printReportPage(examName, pw) {
+  if (!verifyTeacher(pw)) {
+    return HtmlService.createHtmlOutput('<body><p>管理密碼錯誤，無法列印。</p></body>').setTitle('列印失敗');
+  }
+  var g = hGrid(examName);
+  if (!g.success) {
+    return HtmlService.createHtmlOutput('<body><p>' + escHtml(g.message) + '</p></body>').setTitle('列印失敗');
+  }
+  var isAvg = function (s) { return (s.code || '').indexOf('平均') >= 0 || (s.name || '').indexOf('平均') >= 0; };
+  var isDer = function (s) { return DERIVED_RE.test(s.code || '') || DERIVED_RE.test(s.name || ''); };
+  var fmt = function (sub, v) {
+    if (v === null || v === undefined || v === '') return '';
+    if (isAvg(sub)) { var n = Number(v); return isFinite(n) ? String(Math.round(n * 100) / 100) : String(v); }
+    return String(v);
+  };
+  var head = ['座號', '姓名'].concat(g.subjects.map(function (s) { return stripWeightSuffix(String(s.name || '')); }));
+  var html = '<h2>' + escHtml(getSystemTitle()) + '總表 — ' + escHtml(examName) + '</h2>';
+  var t = new Date();
+  html += '<div class="rp-sub">列印日期：' + t.getFullYear() + '/' + (t.getMonth() + 1) + '/' + t.getDate() + '　共 ' + g.students.length + ' 人（未滿 60 分紅字標示）</div>';
+  html += '<table><thead><tr>';
+  head.forEach(function (h) { html += '<th>' + escHtml(h) + '</th>'; });
+  html += '</tr></thead><tbody>';
+  g.students.forEach(function (st) {
+    html += '<tr' + (st.excluded ? ' class="test"' : '') + '><td>' + escHtml(st.seat == null ? '' : st.seat) + '</td><td class="name">' + escHtml(st.name || '') + (st.excluded ? '（測）' : '') + '</td>';
+    g.subjects.forEach(function (sub) {
+      var v = g.scores[st.id + '_' + sub.id];
+      var fail = !isDer(sub) && !isAvg(sub) && v !== null && v !== undefined && v !== '' && Number(v) < 60;
+      html += '<td' + (fail ? ' class="fail"' : '') + '>' + escHtml(fmt(sub, v)) + '</td>';
+    });
+    html += '</tr>';
+  });
+  html += '</tbody></table>';
+  var pure = g.subjects.filter(function (s) { return !isDer(s); });
+  var kids = g.students.filter(function (st) { return !st.excluded; });
+  var stats = pure.map(function (sub) {
+    var vals = [];
+    kids.forEach(function (st) {
+      var v = g.scores[st.id + '_' + sub.id];
+      if (v !== null && v !== undefined && v !== '' && !isNaN(Number(v))) vals.push(Number(v));
+    });
+    if (!vals.length) return { name: stripWeightSuffix(sub.name), n: 0 };
+    var pass = vals.filter(function (v) { return v >= 60; }).length;
+    var sum = vals.reduce(function (a, b) { return a + b; }, 0);
+    return { name: stripWeightSuffix(sub.name), n: vals.length, avg: Math.round(sum / vals.length * 100) / 100, max: Math.max.apply(null, vals), min: Math.min.apply(null, vals), rate: Math.round(pass / vals.length * 1000) / 10, g90: vals.filter(function (v) { return v >= 90; }).length, g80: vals.filter(function (v) { return v >= 80 && v < 90; }).length, g70: vals.filter(function (v) { return v >= 70 && v < 80; }).length, g60: vals.filter(function (v) { return v >= 60 && v < 70; }).length, g0: vals.filter(function (v) { return v < 60; }).length };
+  });
+  if (stats.length) html += '<h3>全班統計</h3>' + statsTableServer(stats);
+  html += '<div class="rp-foot">※ 總分、平均、排名、前名次、進退步由系統自動計算。</div>';
+  var doc = '<!DOCTYPE html><html lang="zh-TW"><head><meta charset="UTF-8"><title>成績總表</title>'
+    + '<style>' + REPORT_CSS + '</style></head><body onload="window.print()">' + html + '</body></html>';
+  return HtmlService.createHtmlOutput(doc).setTitle('成績總表');
+}
+
+// ============================================================
+// 全班個人成績單批次（一次讀取、逐生組裝，避免逐人多次讀表超時）
+// ============================================================
+function hClassSlips(examName) {
+  var exam = String(examName || '').trim();
+  var sh = getSS().getSheetByName(exam);
+  if (!sh) return { success: false, message: '找不到考試：' + exam };
+  var data = sh.getDataRange().getValues();
+  if (data.length < 2) return { success: false, message: '工作表無資料' };
+  var headers = data[0].map(function (x) { return String(x == null ? '' : x).trim(); });
+  var seatCol = findSeatCol(headers), nameCol = findNameCol(headers);
+  var rowBySeat = {};
+  for (var i = 1; i < data.length; i++) {
+    var k = normSeat(data[i][seatCol]);
+    if (k && String(data[i][seatCol]).trim() && rowBySeat[k] == null) rowBySeat[k] = i;
+  }
+  var pureIdx = [];
+  headers.forEach(function (h, idx) {
+    if (idx === seatCol || idx === nameCol || !h) return;
+    if (isPureSubject(h)) pureIdx.push(idx);
+  });
+  var rankFor = function (pi) {
+    var subj = stripWeightSuffix(headers[pi]);
+    for (var j = 0; j < headers.length; j++) {
+      var h = headers[j];
+      if (!/排名|名次/.test(h)) continue;
+      if (h === '班名次' || h === '前名次') continue;
+      var base = h.replace(/排名|名次/g, '');
+      if (!base) continue;
+      if (subj.indexOf(base) === 0) return j;
+    }
+    return -1;
+  };
+  var rankOf = {};
+  pureIdx.forEach(function (pi) { rankOf[pi] = rankFor(pi); });
+  var avgIdx = -1;
+  for (var a = 0; a < headers.length; a++) {
+    if (headers[a].indexOf('平均') >= 0) { avgIdx = a; break; }
+  }
+  var summaryIdx = [];
+  headers.forEach(function (h, idx) {
+    if (idx === seatCol || idx === nameCol || !h) return;
+    if (isPureSubject(h)) return;
+    if (/排名|名次/.test(h) && h !== '班名次' && h !== '前名次') return;
+    summaryIdx.push(idx);
+  });
+  var cellOf = function (ri, ci) {
+    if (ri == null) return null;
+    var v = data[ri][ci];
+    return (v === '' || v == null) ? null : v;
+  };
+  var accounts = readAccounts();
+  accounts.sort(function (x, y) {
+    var a = parseFloat(x.seat), b = parseFloat(y.seat);
+    if (!isNaN(a) && !isNaN(b)) return a - b;
+    return String(x.seat) < String(y.seat) ? -1 : 1;
+  });
+  // 趨勢：每張考卷只讀一次
+  var exams = orderedExamNames();
+  var trendBySeat = {};
+  exams.forEach(function (n) {
+    var s2 = getSS().getSheetByName(n);
+    if (!s2) return;
+    var dd = s2.getDataRange().getValues();
+    if (dd.length < 2) return;
+    var hh = dd[0].map(function (x) { return String(x == null ? '' : x).trim(); });
+    var sc = findSeatCol(hh);
+    var ai = -1, ci = -1;
+    for (var j = 0; j < hh.length; j++) {
+      if (ai < 0 && hh[j].indexOf('平均') >= 0) ai = j;
+      if (hh[j] === '班名次') ci = j;
+    }
+    for (var r = 1; r < dd.length; r++) {
+      if (!String(dd[r][sc] == null ? '' : dd[r][sc]).trim()) continue;
+      var kk = normSeat(dd[r][sc]);
+      if (!trendBySeat[kk]) trendBySeat[kk] = [];
+      trendBySeat[kk].push({ exam_name: n, average: ai >= 0 ? toNum(dd[r][ai]) : null, rank: ci >= 0 ? toNum(dd[r][ci]) : null });
+    }
+  });
+  var students = accounts.map(function (ac) {
+    var ri = rowBySeat[normSeat(ac.seat)];
+    var subjects = pureIdx.map(function (pi) {
+      var rj = rankOf[pi];
+      return { name: stripWeightSuffix(headers[pi]), score: cellOf(ri, pi), rank: rj >= 0 ? cellOf(ri, rj) : null };
+    });
+    var summary = summaryIdx.map(function (si) { return { name: headers[si], value: cellOf(ri, si) }; });
+    var offAvg = avgIdx >= 0 ? toNum(cellOf(ri, avgIdx)) : null;
+    var sum = 0, nn = 0;
+    pureIdx.forEach(function (pi) {
+      var v = toNum(cellOf(ri, pi));
+      if (v !== null) { sum += v; nn++; }
+    });
+    var avg = nn ? Math.round(sum / nn * 100) / 100 : null;
+    var tb = trendBySeat[normSeat(ac.seat)] || [];
+    return { account: ac.account, seat: ac.seat, name: ac.name + (ac.excluded ? '（測）' : ''), classNo: ac.classNo, excluded: ac.excluded, subjects: subjects, summary: summary, avg: (offAvg !== null && offAvg !== undefined) ? offAvg : avg, trend: tb.filter(function (p) { return p.average != null || p.rank != null; }), hasRow: ri != null };
+  });
+  var stats = [];
+  try {
+    var st = hStudentStats(exam);
+    if (st.success) stats = st.stats || [];
+  } catch (e) {}
+  return { success: true, exam: exam, students: students, stats: stats };
+}
+
+function printSlipsPage(examName, pw) {
+  if (!verifyTeacher(pw)) {
+    return HtmlService.createHtmlOutput('<body><p>管理密碼錯誤，無法列印。</p></body>').setTitle('列印失敗');
+  }
+  var d = hClassSlips(examName);
+  if (!d.success) {
+    return HtmlService.createHtmlOutput('<body><p>' + escHtml(d.message) + '</p></body>').setTitle('列印失敗');
+  }
+  var t = new Date();
+  var ds = t.getFullYear() + '/' + (t.getMonth() + 1) + '/' + t.getDate();
+  var title = getSystemTitle();
+  var statsHTML = d.stats.length ? '<h3>全班統計</h3>' + statsTableServer(d.stats) : '';
+  var parts = d.students.map(function (stu) {
+    var subRows = '';
+    stu.subjects.forEach(function (s) {
+      var v = (s.score === null || s.score === undefined || s.score === '') ? '—' : String(s.score);
+      var n = parseFloat(v);
+      var cls = '';
+      if (!isNaN(n) && v !== '—') cls = n >= 60 ? 'pass' : 'fail';
+      var rk = (s.rank === null || s.rank === undefined || s.rank === '') ? '—' : String(s.rank);
+      subRows += '<tr><td class="sub">' + escHtml(s.name) + '</td><td class="' + cls + '">' + escHtml(v) + '</td><td>' + escHtml(rk) + '</td></tr>';
+    });
+    var sumRows = '';
+    stu.summary.forEach(function (s) {
+      sumRows += '<tr><td class="sub">' + escHtml(s.name) + '</td><td>' + escHtml(fmt2(s.value)) + '</td></tr>';
+    });
+    var trendHTML = '';
+    if (stu.trend.length) {
+      var ths = stu.trend.map(function (p) { return '<th>' + escHtml(p.exam_name || '') + '</th>'; }).join('');
+      var tdsAvg = stu.trend.map(function (p) { return '<td>' + fmt2(p.average) + '</td>'; }).join('');
+      var tdsRank = stu.trend.map(function (p) { return '<td>' + fmt2(p.rank) + '</td>'; }).join('');
+      trendHTML = '<h3>歷次走勢</h3>' + trendSVGServer(stu.trend)
+        + '<table class="compact" style="margin-top:6px"><thead><tr><th></th>' + ths + '</tr></thead><tbody><tr><td>平均</td>' + tdsAvg + '</tr><tr><td>班名次</td>' + tdsRank + '</tr></tbody></table>';
+    }
+    return '<div class="slip">'
+      + '<h2>' + escHtml(title) + '個人成績單</h2>'
+      + '<div class="sl-sub">' + escHtml(d.exam) + '　列印日期：' + ds + '</div>'
+      + '<div class="sl-info"><span>班級：' + escHtml(stu.classNo || '') + '</span><span>座號：' + escHtml(stu.seat || '') + '</span><span>姓名：' + escHtml(stu.name || '') + '</span><span>平均：' + escHtml(fmt2(stu.avg)) + '</span></div>'
+      + '<table class="scores"><thead><tr><th>科目</th><th>分數</th><th>排名</th></tr></thead><tbody>' + subRows + '</tbody></table>'
+      + '<h3>總分與名次</h3><table class="scores"><thead><tr><th>項目</th><th>內容</th></tr></thead><tbody>' + sumRows + '</tbody></table>'
+      + statsHTML + trendHTML
+      + '<div class="sl-foot">※ 未滿 60 分以紅字標示。總分、平均、排名由系統自動計算。</div>'
+      + '</div>';
+  });
+  var doc = '<!DOCTYPE html><html lang="zh-TW"><head><meta charset="UTF-8"><title>全班個人成績單</title>'
+    + '<style>' + SLIP_CSS + '.slip{page-break-after:always;}.slip:last-child{page-break-after:auto;}</style></head><body onload="window.print()">'
+    + parts.join('') + '</body></html>';
+  return HtmlService.createHtmlOutput(doc).setTitle('全班個人成績單');
+}

@@ -31,3 +31,6 @@ dist-ssr
 
 # deploy 暫存
 .deploy-gh
+
+# 本機憑證（勿提交）
+.supabase-access-token

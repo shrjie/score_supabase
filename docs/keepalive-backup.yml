@@ -42,11 +42,9 @@ jobs:
         env:
           DB_URL: ${{ secrets.SUPABASE_DB_URL }}
         run: |
-          supabase db dump --db-url "$DB_URL" --schema-only -f schema.sql
+          supabase db dump --db-url "$DB_URL" -f schema.sql
           supabase db dump --db-url "$DB_URL" --data-only --use-copy -f data.sql
-          echo "schema.sql: $(wc -c < schema.sql) bytes"
-          echo "data.sql:   $(wc -c < data.sql) bytes"
-          echo "insert 筆數: $(grep -ci 'insert into\|^\\\\\.' data.sql || true)"
+          wc -c schema.sql data.sql
       - uses: actions/upload-artifact@v4
         with:
           name: db-backup-${{ github.run_id }}

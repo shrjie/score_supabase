@@ -4,10 +4,14 @@ import { supabase, rpc } from '../lib/supabase'
 import { useAuth } from '../lib/auth'
 import { useTitle } from '../lib/title'
 import { buildReportHTML, buildSlipsHTML, openPrintWindow } from '../lib/printDocs'
+import ImportStudents from '../components/ImportStudents'
+import ImportScores from '../components/ImportScores'
+import StatsPanel from '../components/StatsPanel'
 
 const TABS = [
   ['grade', '成績編修'],
   ['exam', '考試科目'],
+  ['stats', '統計圖表'],
   ['stu', '學生管理'],
   ['audit', '操作紀錄'],
 ]
@@ -115,6 +119,7 @@ export default function TeacherPage() {
         </div>
         {tab === 'grade' && <GradePanel onModal={setModal} />}
         {tab === 'exam' && <ExamPanel onModal={setModal} title={title} setTitle={setTitle} />}
+        {tab === 'stats' && <StatsPanel />}
         {tab === 'stu' && <StudentPanel onModal={setModal} />}
         {tab === 'audit' && <AuditPanel />}
       </main>
@@ -172,6 +177,7 @@ function GradePanel({ onModal }) {
   const [singleSub, setSingleSub] = useState('')
   const [singleText, setSingleText] = useState('')
   const [singleInfo, setSingleInfo] = useState('')
+  const [importOpen, setImportOpen] = useState(false)
 
   const loadExams = useCallback(async () => {
     const list = await rpc('api_teacher_exams')
@@ -333,6 +339,7 @@ function GradePanel({ onModal }) {
         </div>
         <div><label>&nbsp;</label><button className="btn-g" onClick={() => { setBulkOpen(false); setSingleOpen((v) => !v) }}>單科貼上</button></div>
         <div><label>&nbsp;</label><button className="btn-g" onClick={() => setBulkOpen((v) => !v)}>整班貼上</button></div>
+        <div><label>&nbsp;</label><button className="btn-g" onClick={() => { setSingleOpen(false); setBulkOpen(false); setImportOpen((v) => !v) }}>匯入成績檔</button></div>
         <div><label>&nbsp;</label><button className="btn-g" onClick={printReport}>列印總表(PDF)</button></div>
         <div><label>&nbsp;</label><button className="btn-g" onClick={printSlips}>全班成績單(PDF)</button></div>
         <div><label>&nbsp;</label><button className="btn-g" onClick={exportCSV}>匯出CSV</button></div>
@@ -370,6 +377,13 @@ function GradePanel({ onModal }) {
           </div>
           <textarea className="bulk" style={{ height: 140 }} value={singleText} onChange={(e) => setSingleText(e.target.value)} placeholder="每列一個分數（座號順序）" />
           <div className="info">{singleInfo}</div>
+        </div>
+      )}
+
+      {importOpen && (
+        <div className="card dashed" style={{ marginTop: 12 }}>
+          <h3>匯入成績檔（Excel / CSV）<button className="btn-g btn-s" style={{ float: 'right' }} onClick={() => setImportOpen(false)}>關閉</button></h3>
+          <ImportScores exams={exams} onDone={async (id) => { await loadExams(); if (id) setExamId(id) }} />
         </div>
       )}
 
@@ -529,6 +543,7 @@ function StudentPanel({ onModal }) {
   const [students, setStudents] = useState([])
   const [info, setInfo] = useState('')
   const [form, setForm] = useState({ account: '', password: '', seat: '', name: '', class_no: '1421', excluded: false })
+  const [importOpen, setImportOpen] = useState(false)
 
   const reload = useCallback(async () => {
     const list = await rpc('api_teacher_students')
@@ -571,6 +586,15 @@ function StudentPanel({ onModal }) {
   return (
     <div className="card">
       <h3>學生名單 <span className="hint">(測試帳不列入排名)</span></h3>
+      <div className="row" style={{ marginTop: 8 }}>
+        <div><label>&nbsp;</label><button className="btn-g" onClick={() => setImportOpen((v) => !v)}>匯入名冊(Excel/CSV)</button></div>
+      </div>
+      {importOpen && (
+        <div className="card dashed" style={{ marginTop: 12 }}>
+          <h3>批次匯入學生名冊<button className="btn-g btn-s" style={{ float: 'right' }} onClick={() => setImportOpen(false)}>關閉</button></h3>
+          <ImportStudents onDone={reload} />
+        </div>
+      )}
       <table className="sub" style={{ marginTop: 8 }}>
         <thead><tr><th>座號</th><th>姓名</th><th>帳號</th><th>班級</th><th>狀態</th><th /></tr></thead>
         <tbody>

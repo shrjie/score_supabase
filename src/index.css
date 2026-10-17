@@ -83,6 +83,10 @@ table.compact th, table.compact td { padding: 6px 4px; text-align: center; }
 .tabs button { background: #fff; border: 1.5px solid #bfe3c6; color: #2e7d32; }
 .tabs button.on { background: #2e7d32; color: #fff; }
 .info { font-size: 13px; color: #3d7a52; margin-top: 8px; }
+.kpis { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
+.kpi { flex: 1 1 110px; min-width: 100px; background: linear-gradient(180deg, #eef7f0, #e2f0e6); border: 1.5px solid rgba(102,187,106,.35); border-radius: 10px; padding: 10px; text-align: center; }
+.kpi-v { font-size: 22px; font-weight: 900; color: #2e7d32; }
+.kpi-l { font-size: 11px; color: var(--text-soft); margin-top: 2px; }
 .err-box { background: #fce4ec; border: 1px solid #f06292; color: #a01a5a; border-radius: 8px; padding: 10px; font-size: 13px; margin-top: 8px; }
 .badge { display: inline-block; font-size: 11px; font-weight: 700; border-radius: 20px; padding: 2px 10px; background: rgba(46,125,50,.12); color: #2e7d32; }
 .test-badge { display: inline-block; background: #ff9800; color: #fff; font-size: 10px; font-weight: 900; border-radius: 6px; padding: 1px 5px; margin-left: 4px; }

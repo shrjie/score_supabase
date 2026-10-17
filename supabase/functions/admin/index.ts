@@ -47,6 +47,9 @@ Deno.serve(async (req) => {
     if (action === 'upsert_student') {
       return await upsertStudent(admin, body)
     }
+    if (action === 'reset_password') {
+      return await resetPassword(admin, body)
+    }
     if (action === 'delete_student') {
       return await deleteStudent(admin, body)
     }
@@ -124,6 +127,20 @@ async function deleteStudent(admin: any, b: Record<string, unknown>) {
   await admin.from('students').delete().eq('id', existing.id)
   if (existing.user_id) await admin.auth.admin.deleteUser(existing.user_id)
   await admin.from('audit_logs').insert({ actor: 'teacher', action: 'delete_student', detail: `帳號=${account}` })
+  return json({ success: true })
+}
+
+async function resetPassword(admin: any, b: Record<string, unknown>) {
+  const account = String(b.account ?? '').trim()
+  const password = String(b.password ?? '')
+  if (!account || !password) return json({ success: false, message: '帳號與新密碼不可空白' }, 400)
+  if (password.length < 6) return json({ success: false, message: '新密碼至少 6 碼' }, 400)
+  const { data: existing } = await admin.from('students').select('id, user_id').eq('account', account).maybeSingle()
+  if (!existing) return json({ success: false, message: '找不到學生' }, 404)
+  if (!existing.user_id) return json({ success: false, message: '此學生尚未建立登入帳號' }, 400)
+  const { error } = await admin.auth.admin.updateUserById(existing.user_id, { password })
+  if (error) return json({ success: false, message: error.message }, 400)
+  await admin.from('audit_logs').insert({ actor: 'teacher', action: 'reset_password', detail: `學生帳號=${account}` })
   return json({ success: true })
 }
 

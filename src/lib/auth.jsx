@@ -64,8 +64,21 @@ export function AuthProvider({ children }) {
     setMe(null)
   }
 
+  // 老師變更自己的密碼：先以舊密碼重新驗證，再更新
+  async function changePassword(oldPw, newPw) {
+    const { data: { user } } = await supabase.auth.getUser()
+    if (!user?.email) return { success: false, message: '找不到登入者資訊' }
+    if (!oldPw) return { success: false, message: '請輸入舊密碼' }
+    if (!newPw || String(newPw).length < 6) return { success: false, message: '新密碼至少 6 碼' }
+    const { error: vErr } = await supabase.auth.signInWithPassword({ email: user.email, password: oldPw })
+    if (vErr) return { success: false, message: '舊密碼錯誤' }
+    const { error } = await supabase.auth.updateUser({ password: newPw })
+    if (error) return { success: false, message: error.message }
+    return { success: true }
+  }
+
   const value = useMemo(
-    () => ({ session, me, loading, signInTeacher, signInStudent, signOut, reloadMe: loadMe }),
+    () => ({ session, me, loading, signInTeacher, signInStudent, signOut, changePassword, reloadMe: loadMe }),
     [session, me, loading],
   )
 

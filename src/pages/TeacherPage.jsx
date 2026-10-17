@@ -29,7 +29,7 @@ function Modal({ state, onClose }) {
 
 export default function TeacherPage() {
   const { title, setTitle } = useTitle()
-  const { me, session, signInTeacher, signOut, loading } = useAuth()
+  const { me, session, signInTeacher, signOut, changePassword, loading } = useAuth()
 
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
@@ -37,6 +37,7 @@ export default function TeacherPage() {
 
   const [tab, setTab] = useState('grade')
   const [modal, setModal] = useState(null)
+  const [pwOpen, setPwOpen] = useState(false)
 
   const isTeacher = me?.success && me.role === 'teacher'
 
@@ -93,10 +94,14 @@ export default function TeacherPage() {
           <h1>
             老師成績管理 <Link className="switch-link" to="/">回學生端</Link>
           </h1>
-          <button className="btn-g btn-s" onClick={signOut}>登出</button>
+          <div className="hd-right">
+            <button className="btn-g btn-s" onClick={() => setPwOpen((v) => !v)}>變更密碼</button>
+            <button className="btn-g btn-s" onClick={signOut}>登出</button>
+          </div>
         </div>
       </header>
       <main>
+        {pwOpen && <PasswordPanel changePassword={changePassword} onClose={() => setPwOpen(false)} />}
         <div className="tabs">
           {TABS.map(([k, label]) => (
             <button key={k} className={tab === k ? 'on' : ''} onClick={() => setTab(k)}>{label}</button>
@@ -108,6 +113,42 @@ export default function TeacherPage() {
         {tab === 'audit' && <AuditPanel />}
       </main>
       <Modal state={modal} onClose={() => setModal(null)} />
+    </div>
+  )
+}
+
+function PasswordPanel({ changePassword, onClose }) {
+  const [oldPw, setOldPw] = useState('')
+  const [newPw, setNewPw] = useState('')
+  const [newPw2, setNewPw2] = useState('')
+  const [info, setInfo] = useState('')
+  const [err, setErr] = useState('')
+  const [busy, setBusy] = useState(false)
+
+  async function submit() {
+    setErr(''); setInfo('')
+    if (!oldPw || !newPw) { setErr('舊密碼與新密碼不可空白'); return }
+    if (newPw !== newPw2) { setErr('兩次新密碼不一致'); return }
+    setBusy(true)
+    const d = await changePassword(oldPw, newPw)
+    setBusy(false)
+    if (!d.success) { setErr(d.message); return }
+    setInfo('✅ 密碼已變更')
+    setOldPw(''); setNewPw(''); setNewPw2('')
+  }
+
+  return (
+    <div className="card dashed" style={{ borderColor: '#66bb6a' }}>
+      <h3>變更管理密碼 <button className="btn-g btn-s" style={{ float: 'right' }} onClick={onClose}>關閉</button></h3>
+      <br />
+      <div className="row">
+        <div><label>舊密碼</label><input type="password" value={oldPw} onChange={(e) => setOldPw(e.target.value)} /></div>
+        <div><label>新密碼 (至少6碼)</label><input type="password" value={newPw} onChange={(e) => setNewPw(e.target.value)} /></div>
+        <div><label>確認新密碼</label><input type="password" value={newPw2} onChange={(e) => setNewPw2(e.target.value)} /></div>
+        <div><label>&nbsp;</label><button className="btn-p" disabled={busy} onClick={submit}>{busy ? '處理中…' : '變更密碼'}</button></div>
+      </div>
+      {info && <div className="info">{info}</div>}
+      {err && <div className="err-box show">{err}</div>}
     </div>
   )
 }
@@ -510,6 +551,17 @@ function StudentPanel({ onModal }) {
     reload()
   }
 
+  async function resetPassword(s) {
+    const pw = prompt(`將學生「${s.seat} ${s.name}」的密碼重設為：`, '')
+    if (pw === null) return
+    if (pw.trim().length < 6) { setInfo('❌ 新密碼至少 6 碼'); return }
+    const { data, error } = await supabase.functions.invoke('admin', {
+      body: { action: 'reset_password', account: s.account, password: pw.trim() },
+    })
+    if (error || !data?.success) { setInfo('❌ ' + (error?.message || data?.message || '失敗')); return }
+    setInfo(`✅ 已重設「${s.seat} ${s.name}」的密碼`)
+  }
+
   return (
     <div className="card">
       <h3>學生名單 <span className="hint">(測試帳不列入排名)</span></h3>
@@ -523,7 +575,10 @@ function StudentPanel({ onModal }) {
               <td>{s.account}</td>
               <td>{s.class_no}</td>
               <td>{s.excluded ? '測試(不排名)' : '正式'}</td>
-              <td><button className="btn-g btn-s" onClick={() => toggleExcluded(s)}>{s.excluded ? '轉正式' : '設測試'}</button></td>
+              <td>
+                <button className="btn-g btn-s" onClick={() => toggleExcluded(s)}>{s.excluded ? '轉正式' : '設測試'}</button>{' '}
+                <button className="btn-g btn-s" onClick={() => resetPassword(s)}>重設密碼</button>
+              </td>
             </tr>
           ))}
         </tbody>

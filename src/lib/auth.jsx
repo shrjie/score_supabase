@@ -1,9 +1,8 @@
 import { createContext, useContext, useEffect, useMemo, useState } from 'react'
 import { supabase, accountToEmail, rpc } from './supabase'
+import { TEACHER_EMAIL } from './config'
 
 const AuthContext = createContext(null)
-
-const TEACHER_EMAIL = import.meta.env.VITE_TEACHER_EMAIL || 'admin@teachers.grade.local'
 
 export function AuthProvider({ children }) {
   const [session, setSession] = useState(null)

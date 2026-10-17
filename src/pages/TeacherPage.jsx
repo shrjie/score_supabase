@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom'
 import { supabase, rpc } from '../lib/supabase'
 import { useAuth } from '../lib/auth'
 import { useTitle } from '../lib/title'
+import { TEACHER_DOMAIN, DEFAULT_CLASS } from '../lib/config'
 import { buildReportHTML, buildSlipsHTML, openPrintWindow } from '../lib/printDocs'
 import ImportStudents from '../components/ImportStudents'
 import ImportScores from '../components/ImportScores'
@@ -18,7 +19,7 @@ const TABS = [
 
 function actorLabel(actor) {
   const a = String(actor ?? '')
-  if (!a || a === 'teacher' || a.includes('@teachers.grade.local')) return '老師'
+  if (!a || a === 'teacher' || a.includes('@' + TEACHER_DOMAIN)) return '老師'
   return a
 }
 
@@ -542,7 +543,7 @@ function ExamPanel({ onModal, title, setTitle }) {
 function StudentPanel({ onModal }) {
   const [students, setStudents] = useState([])
   const [info, setInfo] = useState('')
-  const [form, setForm] = useState({ account: '', password: '', seat: '', name: '', class_no: '1421', excluded: false })
+  const [form, setForm] = useState({ account: '', password: '', seat: '', name: '', class_no: DEFAULT_CLASS, excluded: false })
   const [importOpen, setImportOpen] = useState(false)
 
   const reload = useCallback(async () => {
@@ -558,7 +559,7 @@ function StudentPanel({ onModal }) {
     })
     if (error || !data?.success) { setInfo('❌ ' + (error?.message || data?.message || '失敗')); return }
     setInfo('✅ 已儲存')
-    setForm({ account: '', password: '', seat: '', name: '', class_no: '1421', excluded: false })
+    setForm({ account: '', password: '', seat: '', name: '', class_no: DEFAULT_CLASS, excluded: false })
     reload()
   }
 

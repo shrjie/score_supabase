@@ -1,4 +1,5 @@
 import { createClient } from '@supabase/supabase-js'
+import { STUDENT_EMAIL_DOMAIN } from './config'
 
 const url = import.meta.env.VITE_SUPABASE_URL
 const anonKey = import.meta.env.VITE_SUPABASE_ANON_KEY
@@ -11,8 +12,7 @@ export const supabase = createClient(url ?? '', anonKey ?? '', {
   auth: { persistSession: true, autoRefreshToken: true },
 })
 
-// 學生帳號 → 合成 Email（Supabase Auth 需要 Email 形式）
-export const STUDENT_EMAIL_DOMAIN = import.meta.env.VITE_STUDENT_EMAIL_DOMAIN || 'students.grade.local'
+export { STUDENT_EMAIL_DOMAIN }
 
 export function accountToEmail(account) {
   return `${String(account).trim().toLowerCase()}@${STUDENT_EMAIL_DOMAIN}`

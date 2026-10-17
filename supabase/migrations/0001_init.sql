@@ -17,7 +17,7 @@ create table if not exists public.students (
   account text not null unique,
   seat text not null default '',
   name text not null default '',
-  class_no text not null default '1421',
+  class_no text not null default '',
   excluded boolean not null default false,
   created_at timestamptz not null default now()
 );
@@ -516,5 +516,5 @@ grant execute on function public.api_audit(int) to authenticated;
 grant execute on function public.api_config_set_title(text) to authenticated;
 
 -- ---------------- 預設設定 ----------------
-insert into public.app_config (key, value) values ('SYSTEM_TITLE', '福山國中成績查詢')
+insert into public.app_config (key, value) values ('SYSTEM_TITLE', '班級成績查詢系統')
   on conflict (key) do nothing;

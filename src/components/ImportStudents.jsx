@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { supabase } from '../lib/supabase'
+import { DEFAULT_CLASS } from '../lib/config'
 import { parseTable, mapStudents } from '../lib/tabular'
 import { downloadCsv } from '../lib/csvTemplate'
 
@@ -16,7 +17,7 @@ export default function ImportStudents({ onDone }) {
   function template() {
     downloadCsv('學生名冊範本', [
       ['帳號', '密碼', '座號', '姓名', '班級', '測試'],
-      ['1412101', 'A123456789', '1', '王小明', '1421', ''],
+      ['1412101', 'A123456789', '1', '王小明', DEFAULT_CLASS, ''],
     ])
   }
 

@@ -4,6 +4,7 @@
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
 
 const STUDENT_EMAIL_DOMAIN = Deno.env.get('STUDENT_EMAIL_DOMAIN') ?? 'students.grade.local'
+const DEFAULT_CLASS = Deno.env.get('DEFAULT_CLASS') ?? ''
 
 const cors = {
   'Access-Control-Allow-Origin': '*',
@@ -66,7 +67,7 @@ async function upsertStudent(admin: any, b: Record<string, unknown>) {
   const account = String(b.account ?? '').trim()
   const seat = String(b.seat ?? '').trim()
   const name = String(b.name ?? '').trim()
-  const classNo = String(b.class_no ?? '1421').trim() || '1421'
+  const classNo = String(b.class_no ?? DEFAULT_CLASS).trim() || DEFAULT_CLASS
   const excluded = !!b.excluded
   const password = b.password ? String(b.password) : ''
 

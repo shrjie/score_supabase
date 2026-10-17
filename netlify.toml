@@ -11,7 +11,7 @@
   to = "/index.html"
   status = 200
 
-# 安全性標頭
+# 安全性標頭（connect-src 允許任意 Supabase 專案，以支援各自安裝）
 [[headers]]
   for = "/*"
   [headers.values]
@@ -19,4 +19,9 @@
     X-Content-Type-Options = "nosniff"
     Referrer-Policy = "strict-origin-when-cross-origin"
     Permissions-Policy = "geolocation=(), microphone=(), camera=()"
-    Content-Security-Policy = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' https://ufsbtxlqbhaxaavxpozo.supabase.co wss://ufsbtxlqbhaxaavxpozo.supabase.co https://*.netlify.com https://*.netlify.app; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'"
+    Content-Security-Policy = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' https://*.supabase.co wss://*.supabase.co https://*.netlify.com https://*.netlify.app; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'"
+
+# Deploy to Netlify 按鈕會依此清單提示使用者填入環境變數
+[template.environment]
+  VITE_SUPABASE_URL = ""
+  VITE_SUPABASE_ANON_KEY = ""

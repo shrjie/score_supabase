@@ -101,7 +101,7 @@ export default function TeacherPage() {
             老師成績管理 <Link className="switch-link" to="/">回學生端</Link>
           </h1>
           <div className="hd-right">
-            <button className="btn-g btn-s" onClick={() => setPwOpen((v) => !v)}>變更密碼</button>
+            <button className="btn-g btn-s" onClick={() => setPwOpen((v) => !v)}>改管理密碼</button>
             <button className="btn-g btn-s" onClick={signOut}>登出</button>
           </div>
         </div>
@@ -145,13 +145,13 @@ function PasswordPanel({ changePassword, onClose }) {
 
   return (
     <div className="card dashed" style={{ borderColor: '#66bb6a' }}>
-      <h3>變更管理密碼 <button className="btn-g btn-s" style={{ float: 'right' }} onClick={onClose}>關閉</button></h3>
+      <h3>改管理密碼 <button className="btn-g btn-s" style={{ float: 'right' }} onClick={onClose}>關閉</button></h3>
       <br />
       <div className="row">
         <div><label>舊密碼</label><input type="password" value={oldPw} onChange={(e) => setOldPw(e.target.value)} /></div>
         <div><label>新密碼 (至少6碼)</label><input type="password" value={newPw} onChange={(e) => setNewPw(e.target.value)} /></div>
         <div><label>確認新密碼</label><input type="password" value={newPw2} onChange={(e) => setNewPw2(e.target.value)} /></div>
-        <div><label>&nbsp;</label><button className="btn-p" disabled={busy} onClick={submit}>{busy ? '處理中…' : '變更密碼'}</button></div>
+        <div><label>&nbsp;</label><button className="btn-p" disabled={busy} onClick={submit}>{busy ? '處理中…' : '確認變更'}</button></div>
       </div>
       {info && <div className="info">{info}</div>}
       {err && <div className="err-box show">{err}</div>}

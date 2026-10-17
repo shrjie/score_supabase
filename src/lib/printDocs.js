@@ -12,6 +12,35 @@ export function fmt2(v) {
   return String(Math.round(n * 100) / 100)
 }
 
+// 科目 → 排名欄名（國文→國排名、英文→英排名，取首字）
+export function rankLabel(name) {
+  const s = String(name || '').trim()
+  return (s ? s.slice(0, 1) : '') + '排名'
+}
+
+export const SUMMARY_COLS = ['總分', '平均', '班名次', '前名次', '進退步']
+
+// 由 api_class_slips 的結果建立衍生值查找表
+export function buildDerived(slipsStudents) {
+  const byStudent = {}
+  const subRank = {}
+  ;(slipsStudents || []).forEach((st) => {
+    const sum = {}
+    ;(st.summary || []).forEach((x) => { sum[x.name] = x.value })
+    byStudent[st.id] = sum
+    ;(st.subjects || []).forEach((s) => { subRank[`${st.id}_${s.name}`] = s.rank })
+  })
+  return { byStudent, subRank }
+}
+
+// 衍生值 → 顯示字串（平均取 2 位、進退步加正號）
+export function fmtSummary(name, v) {
+  if (v === null || v === undefined || v === '') return ''
+  if (name === '平均') return String(Math.round(Number(v) * 100) / 100)
+  if (name === '進退步') return v > 0 ? '+' + v : String(v)
+  return String(v)
+}
+
 export function openPrintWindow(html) {
   const w = window.open('', '_blank')
   if (!w) {
@@ -23,13 +52,18 @@ export function openPrintWindow(html) {
   w.document.close()
 }
 
-const REPORT_CSS = `body{font-family:sans-serif;color:#000;margin:8mm}
+const REPORT_CSS = `@page{size:A4 landscape;margin:8mm}
+body{font-family:sans-serif;color:#000;margin:8mm}
 h2{font-size:18px;text-align:center;margin-bottom:2px}
 .rp-sub{text-align:center;font-size:11px;margin-bottom:6px}
 table{border-collapse:collapse;width:100%;table-layout:fixed}
 th,td{border:1px solid #333;padding:2px 3px;font-size:9.5px;text-align:center;white-space:nowrap;overflow:hidden}
 th{background:#eee;-webkit-print-color-adjust:exact;print-color-adjust:exact}
 td.name{text-align:left}td.fail{color:#c00;font-weight:900}
+td.rk{color:#777;font-size:8.5px}
+td.sum{background:#f4f4f4;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+td.prog{color:#1565c0;font-weight:900}td.reg{color:#c00;font-weight:900}
+th.der{background:#e6efe8}
 tr.test td{background:#f0f0f0;-webkit-print-color-adjust:exact;print-color-adjust:exact}
 .rp-foot{font-size:10px;margin-top:6px}h3{font-size:14px;text-align:center;margin:10px 0 4px}
 table.compact th,table.compact td{font-size:8.5px;padding:2px 2px}`
@@ -60,38 +94,44 @@ function statsTable(rows) {
   return h + '</tbody></table>'
 }
 
-function isAvgName(name) {
-  return String(name || '').includes('平均')
-}
-function isDerivedName(name) {
-  return /排名|名次|總分|平均|進退步|前名次/.test(String(name || ''))
-}
-
-// 全班總表（座號/姓名/各科 + 全班統計）
-export function buildReportHTML({ title, examName, students, subjects, scores, stats }) {
+// 全班總表（座號/姓名/各科+科排名/總分/平均/班名次/前名次/進退步 + 全班統計）
+export function buildReportHTML({ title, examName, students, subjects, scores, stats, derived }) {
   const d = new Date()
   const ds = `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()}`
-  const head = ['座號', '姓名', ...subjects.map((s) => s.name)]
+  const head = ['座號', '姓名']
+  subjects.forEach((s) => { head.push(s.name); head.push(rankLabel(s.name)) })
+  SUMMARY_COLS.forEach((n) => head.push(n))
   let html = `<h2>${esc(title)}總表 — ${esc(examName)}</h2>`
   html += `<div class="rp-sub">列印日期：${ds}　共 ${students.length} 人（未滿 60 分紅字標示）</div>`
   html += '<table><thead><tr>'
-  head.forEach((h) => { html += `<th>${esc(h)}</th>` })
+  html += `<th>${esc(head[0])}</th><th>${esc(head[1])}</th>`
+  subjects.forEach((s) => {
+    html += `<th>${esc(s.name)}</th><th class="der">${esc(rankLabel(s.name))}</th>`
+  })
+  SUMMARY_COLS.forEach((n) => { html += `<th class="der">${esc(n)}</th>` })
   html += '</tr></thead><tbody>'
   students.forEach((st) => {
     html += `<tr${st.excluded ? ' class="test"' : ''}><td>${esc(st.seat)}</td><td class="name">${esc(st.name)}${st.excluded ? '（測）' : ''}</td>`
     subjects.forEach((sub) => {
       const v = scores[`${st.id}_${sub.id}`]
       const num = Number(v)
-      const fail = !isDerivedName(sub.name) && !isAvgName(sub.name) && v !== null && v !== undefined && v !== '' && num < 60
-      let out = v === null || v === undefined || v === '' ? '' : v
-      if (isAvgName(sub.name) && isFinite(num)) out = Math.round(num * 100) / 100
+      const fail = v !== null && v !== undefined && v !== '' && num < 60
+      const out = v === null || v === undefined || v === '' ? '' : v
       html += `<td${fail ? ' class="fail"' : ''}>${esc(out)}</td>`
+      const rk = derived?.subRank?.[`${st.id}_${sub.name}`]
+      html += `<td class="rk">${rk === null || rk === undefined ? '' : esc(rk)}</td>`
+    })
+    SUMMARY_COLS.forEach((n) => {
+      const v = derived?.byStudent?.[st.id]?.[n]
+      const txt = fmtSummary(n, v)
+      const cls = n === '進退步' && v !== null && v !== undefined && v !== '' ? (v > 0 ? 'prog' : v < 0 ? 'reg' : '') : ''
+      html += `<td class="sum${cls ? ' ' + cls : ''}">${esc(txt)}</td>`
     })
     html += '</tr>'
   })
   html += '</tbody></table>'
   if (stats?.length) html += `<h3>全班統計</h3>${statsTable(stats)}`
-  html += '<div class="rp-foot">※ 總分、平均、排名、前名次、進退步由系統自動計算。</div>'
+  html += '<div class="rp-foot">※ 各科排名、總分、平均、班名次、前名次、進退步由系統自動計算。</div>'
   return `<!DOCTYPE html><html lang="zh-TW"><head><meta charset="UTF-8"><title>成績總表</title><style>${REPORT_CSS}</style></head><body onload="window.print()">${html}</body></html>`
 }
 

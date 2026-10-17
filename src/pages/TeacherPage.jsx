@@ -1,10 +1,13 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { Fragment, useCallback, useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { supabase, rpc } from '../lib/supabase'
 import { useAuth } from '../lib/auth'
 import { useTitle } from '../lib/title'
 import { TEACHER_DOMAIN, DEFAULT_CLASS } from '../lib/config'
-import { buildReportHTML, buildSlipsHTML, openPrintWindow } from '../lib/printDocs'
+import {
+  buildReportHTML, buildSlipsHTML, openPrintWindow,
+  rankLabel, SUMMARY_COLS, buildDerived, fmtSummary,
+} from '../lib/printDocs'
 import ImportStudents from '../components/ImportStudents'
 import ImportScores from '../components/ImportScores'
 import StatsPanel from '../components/StatsPanel'
@@ -170,6 +173,7 @@ function GradePanel({ onModal }) {
   const [exams, setExams] = useState([])
   const [examId, setExamId] = useState('')
   const [grid, setGrid] = useState(null)
+  const [derived, setDerived] = useState(null)
   const [info, setInfo] = useState('')
   const [bulkOpen, setBulkOpen] = useState(false)
   const [bulkText, setBulkText] = useState('')
@@ -195,10 +199,13 @@ function GradePanel({ onModal }) {
     if (!d?.success) {
       setInfo('❌ ' + (d?.message || '載入失敗'))
       setGrid(null)
+      setDerived(null)
       return
     }
     setGrid(d)
-    setInfo(`✅ ${d.students.length} 人 × ${d.subjects.length} 科・單格改完自動存`)
+    setInfo(`✅ ${d.students.length} 人 × ${d.subjects.length} 科・單格改完自動存（灰底欄自動計算）`)
+    const sl = await rpc('api_class_slips', { p_exam: id })
+    setDerived(sl?.success ? buildDerived(sl.students) : null)
   }, [])
 
   useEffect(() => { loadGrid(examId) }, [examId, loadGrid])
@@ -220,13 +227,19 @@ function GradePanel({ onModal }) {
   function exportCSV() {
     if (!grid) return
     const lines = []
-    lines.push(['座號', '姓名', ...grid.subjects.map((s) => s.name)].join(','))
+    const head = ['座號', '姓名']
+    grid.subjects.forEach((s) => { head.push(s.name); head.push(rankLabel(s.name)) })
+    SUMMARY_COLS.forEach((n) => head.push(n))
+    lines.push(head.join(','))
     grid.students.forEach((st) => {
       const row = [st.seat, st.name + (st.excluded ? ' (測試)' : '')]
       grid.subjects.forEach((sub) => {
         const v = grid.scores[`${st.id}_${sub.id}`]
         row.push(v === null || v === undefined ? '' : v)
+        const rk = derived?.subRank?.[`${st.id}_${sub.name}`]
+        row.push(rk === null || rk === undefined ? '' : rk)
       })
+      SUMMARY_COLS.forEach((n) => row.push(fmtSummary(n, derived?.byStudent?.[st.id]?.[n])))
       lines.push(row.join(','))
     })
     const blob = new Blob(['\uFEFF' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' })
@@ -303,7 +316,7 @@ function GradePanel({ onModal }) {
     const examName = exams.find((e) => e.id === examId)?.name || ''
     openPrintWindow(buildReportHTML({
       title, examName, students: grid.students, subjects: grid.subjects,
-      scores: grid.scores, stats: Array.isArray(stats) ? stats : [],
+      scores: grid.scores, stats: Array.isArray(stats) ? stats : [], derived,
     }))
   }
 
@@ -394,7 +407,13 @@ function GradePanel({ onModal }) {
             <thead>
               <tr>
                 <th>座號</th><th>姓名</th>
-                {grid.subjects.map((s) => <th key={s.id}>{s.name}</th>)}
+                {grid.subjects.map((s) => (
+                  <Fragment key={s.id}>
+                    <th>{s.name}</th>
+                    <th className="der">{rankLabel(s.name)}</th>
+                  </Fragment>
+                ))}
+                {SUMMARY_COLS.map((n) => <th key={n} className="der">{n}</th>)}
               </tr>
             </thead>
             <tbody>
@@ -405,17 +424,26 @@ function GradePanel({ onModal }) {
                   {grid.subjects.map((sub) => {
                     const key = `${st.id}_${sub.id}`
                     const v = grid.scores[key]
+                    const rk = derived?.subRank?.[`${st.id}_${sub.name}`]
                     return (
-                      <td className="c" key={sub.id}>
-                        <input
-                          className="cell"
-                          inputMode="decimal"
-                          defaultValue={v === null || v === undefined ? '' : v}
-                          key={key + '_' + (v ?? '')}
-                          onBlur={(e) => saveCell(st.id, sub.id, e.target.value.trim())}
-                        />
-                      </td>
+                      <Fragment key={sub.id}>
+                        <td className="c">
+                          <input
+                            className="cell"
+                            inputMode="decimal"
+                            defaultValue={v === null || v === undefined ? '' : v}
+                            key={key + '_' + (v ?? '')}
+                            onBlur={(e) => saveCell(st.id, sub.id, e.target.value.trim())}
+                          />
+                        </td>
+                        <td className="ro rank">{rk === null || rk === undefined ? '' : rk}</td>
+                      </Fragment>
                     )
+                  })}
+                  {SUMMARY_COLS.map((n) => {
+                    const v = derived?.byStudent?.[st.id]?.[n]
+                    const cls = n === '進退步' && v !== null && v !== undefined && v !== '' ? (v > 0 ? 'up' : v < 0 ? 'down' : '') : ''
+                    return <td key={n} className={`ro sum ${cls}`}>{fmtSummary(n, v)}</td>
                   })}
                 </tr>
               ))}

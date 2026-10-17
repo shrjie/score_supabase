@@ -35,16 +35,17 @@ body {
 .card { padding: 32px 30px; }
 .student .card-title { font-size: 17px; font-weight: 700; color: var(--pine); margin-bottom: 22px; }
 .form-group { margin-bottom: 18px; }
-/* 密碼欄的顯示／隱藏切換 */
+/* 密碼欄的顯示／隱藏切換
+   選擇器刻意用 .pw-wrap .pw-btn（權重 0,2,0），高於 .teacher button（0,1,1），避免被覆蓋 */
 .pw-wrap { position: relative; display: inline-flex; align-items: center; width: 100%; }
-.pw-wrap > input { padding-right: 66px; }
-.pw-btns { position: absolute; right: 4px; top: 50%; transform: translateY(-50%); display: flex; align-items: center; gap: 2px; }
-.pw-btn { display: flex; align-items: center; justify-content: center; width: 28px; height: 28px; padding: 0; border: none; border-radius: 8px; background: transparent; color: #7c9a86; cursor: pointer; }
-.pw-btn:hover { background: rgba(102,187,106,.16); color: #2e7d32; }
-.pw-btn:focus-visible { outline: 2px solid var(--leaf); outline-offset: 1px; }
+.pw-wrap > input { padding-right: 68px; }
+.pw-wrap .pw-btns { position: absolute; right: 5px; top: 50%; transform: translateY(-50%); display: flex; align-items: center; gap: 3px; }
+.pw-wrap .pw-btn { display: flex; align-items: center; justify-content: center; width: 28px; height: 28px; padding: 0; border: 1.5px solid rgba(102,187,106,.5); border-radius: 8px; background: #e8f3ea; color: #2e7d32; cursor: pointer; font-size: inherit; font-family: inherit; }
+.pw-wrap .pw-btn:hover { background: #d0e7d6; color: #1b5e20; }
+.pw-wrap .pw-btn:focus-visible { outline: 2px solid #2e7d32; outline-offset: 1px; }
 /* 眼睛：按住顯示、鬆開隱藏 */
-.pw-eye { touch-action: none; -webkit-user-select: none; user-select: none; }
-.pw-eye:active { background: rgba(102,187,106,.28); color: #1b5e20; }
+.pw-wrap .pw-eye { touch-action: none; -webkit-user-select: none; user-select: none; }
+.pw-wrap .pw-eye:active { background: #66bb6a; color: #fff; }
 label { display: block; font-size: 13px; color: var(--text-mid); margin-bottom: 6px; }
 .student input, .student select { width: 100%; padding: 11px 15px; background: rgba(255,255,255,.65); border: 1.5px solid rgba(102,187,106,.4); border-radius: var(--radius-sm); font-size: 15px; font-family: inherit; outline: none; }
 .student input:focus, .student select:focus { border-color: var(--leaf); box-shadow: 0 0 0 3px rgba(102,187,106,.18); }

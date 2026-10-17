@@ -36,11 +36,11 @@ jobs:
   backup:
     runs-on: ubuntu-latest
     steps:
-      - uses: supabase/setup-gh@v1
-        with:
-          project-id: ${{ secrets.SUPABASE_PROJECT_ID }}
-          db-url: ${{ secrets.SUPABASE_DB_URL }}
+      - name: Install Supabase CLI
+        run: npm install -g supabase
       - name: Dump database
+        env:
+          DB_URL: ${{ secrets.SUPABASE_DB_URL }}
         run: supabase db dump --db-url "$DB_URL" -f dump.sql
       - name: Show tables included
         run: grep -c '^insert into' dump.sql || true

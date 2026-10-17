@@ -3,6 +3,8 @@ import { supabase, accountToEmail, rpc } from './supabase'
 
 const AuthContext = createContext(null)
 
+const TEACHER_EMAIL = import.meta.env.VITE_TEACHER_EMAIL || 'admin@teachers.grade.local'
+
 export function AuthProvider({ children }) {
   const [session, setSession] = useState(null)
   const [me, setMe] = useState(null)
@@ -32,9 +34,9 @@ export function AuthProvider({ children }) {
     }
   }, [])
 
-  async function signInTeacher(email, password) {
-    const { error } = await supabase.auth.signInWithPassword({ email, password })
-    if (error) return { success: false, message: error.message }
+  async function signInTeacher(password) {
+    const { error } = await supabase.auth.signInWithPassword({ email: TEACHER_EMAIL, password })
+    if (error) return { success: false, message: '密碼錯誤' }
     const d = await rpc('api_me')
     if (!d?.success || d.role !== 'teacher') {
       await supabase.auth.signOut()

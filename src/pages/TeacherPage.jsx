@@ -12,6 +12,12 @@ const TABS = [
   ['audit', '操作紀錄'],
 ]
 
+function actorLabel(actor) {
+  const a = String(actor ?? '')
+  if (!a || a === 'teacher' || a.includes('@teachers.grade.local')) return '老師'
+  return a
+}
+
 function Modal({ state, onClose }) {
   if (!state) return null
   const good = state.ok !== false
@@ -31,7 +37,6 @@ export default function TeacherPage() {
   const { title, setTitle } = useTitle()
   const { me, session, signInTeacher, signOut, changePassword, loading } = useAuth()
 
-  const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [loginErr, setLoginErr] = useState('')
 
@@ -43,7 +48,11 @@ export default function TeacherPage() {
 
   async function doLogin() {
     setLoginErr('')
-    const d = await signInTeacher(email.trim(), password)
+    if (!password) {
+      setLoginErr('請輸入管理密碼')
+      return
+    }
+    const d = await signInTeacher(password)
     if (!d.success) setLoginErr(d.message)
   }
 
@@ -62,17 +71,14 @@ export default function TeacherPage() {
             <br />
             <div className="row">
               <div>
-                <label>Email</label>
-                <input value={email} onChange={(e) => setEmail(e.target.value)} style={{ width: 260 }} />
-              </div>
-              <div>
-                <label>密碼</label>
+                <label>管理密碼</label>
                 <input
                   type="password"
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   onKeyDown={(e) => e.key === 'Enter' && doLogin()}
-                  style={{ width: 220 }}
+                  placeholder="請輸入管理密碼"
+                  style={{ width: 260 }}
                 />
               </div>
               <div>
@@ -625,7 +631,7 @@ function AuditPanel() {
               return (
                 <tr key={i}>
                   <td style={{ whiteSpace: 'nowrap' }}>{ts}</td>
-                  <td>{l.actor}</td>
+                  <td>{actorLabel(l.actor)}</td>
                   <td>{l.action}</td>
                   <td style={{ wordBreak: 'break-all' }}>{l.detail}</td>
                 </tr>

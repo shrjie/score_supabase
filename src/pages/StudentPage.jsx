@@ -18,6 +18,7 @@ import {
 import { rpc } from '../lib/supabase'
 import { useAuth } from '../lib/auth'
 import { useTitle } from '../lib/title'
+import PasswordInput from '../components/PasswordInput'
 
 function fmtNum(v) {
   if (v === null || v === undefined || v === '') return '—'
@@ -184,12 +185,12 @@ td.sub{text-align:left}td.fail{color:#c00;font-weight:900}td.pass{color:#1565c0;
             </div>
             <div className="form-group">
               <label>密碼</label>
-              <input
-                type="password"
+              <PasswordInput
                 value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && doLogin()}
+                onChange={setPassword}
+                onEnter={doLogin}
                 placeholder="請輸入密碼"
+                style={{ width: '100%' }}
               />
             </div>
             <button className="btn-primary" disabled={busy} onClick={doLogin}>

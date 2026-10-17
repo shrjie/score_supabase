@@ -11,6 +11,7 @@ import {
 import ImportStudents from '../components/ImportStudents'
 import ImportScores from '../components/ImportScores'
 import StatsPanel from '../components/StatsPanel'
+import PasswordInput from '../components/PasswordInput'
 
 const TABS = [
   ['grade', '成績編修'],
@@ -80,12 +81,12 @@ export default function TeacherPage() {
             <div className="row">
               <div>
                 <label>管理密碼</label>
-                <input
-                  type="password"
+                <PasswordInput
                   value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  onKeyDown={(e) => e.key === 'Enter' && doLogin()}
+                  onChange={setPassword}
+                  onEnter={doLogin}
                   placeholder="請輸入管理密碼"
+                  label="管理密碼"
                   style={{ width: 260 }}
                 />
               </div>
@@ -157,9 +158,9 @@ function PasswordPanel({ changePassword, onClose }) {
       <h3>改管理密碼 <button className="btn-g btn-s" style={{ float: 'right' }} onClick={onClose}>關閉</button></h3>
       <br />
       <div className="row">
-        <div><label>舊密碼</label><input type="password" value={oldPw} onChange={(e) => setOldPw(e.target.value)} /></div>
-        <div><label>新密碼 (至少6碼)</label><input type="password" value={newPw} onChange={(e) => setNewPw(e.target.value)} /></div>
-        <div><label>確認新密碼</label><input type="password" value={newPw2} onChange={(e) => setNewPw2(e.target.value)} /></div>
+        <div><label>舊密碼</label><PasswordInput value={oldPw} onChange={setOldPw} label="舊密碼" style={{ width: 150 }} /></div>
+        <div><label>新密碼 (至少6碼)</label><PasswordInput value={newPw} onChange={setNewPw} autoComplete="new-password" label="新密碼" style={{ width: 150 }} /></div>
+        <div><label>確認新密碼</label><PasswordInput value={newPw2} onChange={setNewPw2} autoComplete="new-password" label="確認新密碼" style={{ width: 150 }} /></div>
         <div><label>&nbsp;</label><button className="btn-p" disabled={busy} onClick={submit}>{busy ? '處理中…' : '確認變更'}</button></div>
       </div>
       {info && <div className="info">{info}</div>}
@@ -573,6 +574,10 @@ function StudentPanel({ onModal }) {
   const [info, setInfo] = useState('')
   const [form, setForm] = useState({ account: '', password: '', seat: '', name: '', class_no: DEFAULT_CLASS, excluded: false })
   const [importOpen, setImportOpen] = useState(false)
+  const [pwTarget, setPwTarget] = useState(null)
+  const [pwInput, setPwInput] = useState('')
+  const [pwErr, setPwErr] = useState('')
+  const [pwBusy, setPwBusy] = useState(false)
 
   const reload = useCallback(async () => {
     const list = await rpc('api_teacher_students')
@@ -601,15 +606,24 @@ function StudentPanel({ onModal }) {
     reload()
   }
 
-  async function resetPassword(s) {
-    const pw = prompt(`將學生「${s.seat} ${s.name}」的密碼重設為：`, '')
-    if (pw === null) return
-    if (pw.trim().length < 6) { setInfo('❌ 新密碼至少 6 碼'); return }
+  function resetPassword(s) {
+    setPwTarget(s)
+    setPwInput('')
+    setPwErr('')
+  }
+
+  async function doResetPassword() {
+    if (!pwTarget) return
+    const pw = pwInput.trim()
+    if (pw.length < 6) { setPwErr('新密碼至少 6 碼'); return }
+    setPwBusy(true)
     const { data, error } = await supabase.functions.invoke('admin', {
-      body: { action: 'reset_password', account: s.account, password: pw.trim() },
+      body: { action: 'reset_password', account: pwTarget.account, password: pw },
     })
-    if (error || !data?.success) { setInfo('❌ ' + (error?.message || data?.message || '失敗')); return }
-    setInfo(`✅ 已重設「${s.seat} ${s.name}」的密碼`)
+    setPwBusy(false)
+    if (error || !data?.success) { setPwErr(error?.message || data?.message || '失敗'); return }
+    setInfo(`✅ 已重設「${pwTarget.seat} ${pwTarget.name}」的密碼`)
+    setPwTarget(null)
   }
 
   return (
@@ -653,6 +667,34 @@ function StudentPanel({ onModal }) {
         <div><label>&nbsp;</label><button className="btn-p" onClick={upsert}>儲存</button></div>
       </div>
       <div className="info">{info}</div>
+
+      {pwTarget && (
+        <div className="modal-overlay show" onClick={(e) => e.target === e.currentTarget && setPwTarget(null)}>
+          <div className="modal-box ok">
+            <div className="modal-title">重設學生密碼</div>
+            <div className="modal-msg">
+              {pwTarget.seat} {pwTarget.name}（帳號 {pwTarget.account}）
+            </div>
+            <div style={{ margin: '12px 0' }}>
+              <label style={{ display: 'block', marginBottom: 4 }}>新密碼（至少 6 碼）</label>
+              <PasswordInput
+                value={pwInput}
+                onChange={setPwInput}
+                onEnter={doResetPassword}
+                autoComplete="new-password"
+                placeholder="請輸入新密碼"
+                label="新密碼"
+                style={{ width: '100%' }}
+              />
+            </div>
+            {pwErr && <div className="err-box show">{pwErr}</div>}
+            <div style={{ marginTop: 12, display: 'flex', gap: 8, justifyContent: 'center' }}>
+              <button className="btn-primary" disabled={pwBusy} onClick={doResetPassword}>{pwBusy ? '處理中…' : '確定重設'}</button>
+              <button className="btn-g" onClick={() => setPwTarget(null)}>取消</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

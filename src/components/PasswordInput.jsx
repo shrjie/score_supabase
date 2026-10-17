@@ -22,7 +22,8 @@ const CloseIcon = () => (
 )
 
 // 密碼輸入框
-// - 預設遮罩顯示，可切換明文／隱藏
+// - 預設遮罩顯示；眼睛按鈕為「按住顯示／鬆手自動隱藏」
+//   （滑鼠、觸控、鍵盤 Space/Enter 皆支援）
 // - 聚焦時自動全選：即使有殘留內容，直接打字即可取代
 // - 有內容時顯示「清除」按鈕
 // - clearOnMount：清掉瀏覽器自動填入的舊密碼（Chrome 自動填入不會觸發事件，
@@ -95,19 +96,30 @@ export default function PasswordInput({
             }}
             title="清除"
             aria-label={`清除${label}`}
-            tabIndex={-1}
           >
             <CloseIcon />
           </button>
         )}
         <button
           type="button"
-          className="pw-btn"
-          onClick={() => setShow((v) => !v)}
-          title={show ? `隱藏${label}` : `顯示${label}`}
-          aria-label={show ? `隱藏${label}` : `顯示${label}`}
-          aria-pressed={show}
-          tabIndex={-1}
+          className="pw-btn pw-eye"
+          title={`按住顯示${label}，鬆開自動隱藏`}
+          aria-label={`按住顯示${label}`}
+          onPointerDown={(e) => {
+            e.preventDefault()
+            setShow(true)
+          }}
+          onPointerUp={() => setShow(false)}
+          onPointerLeave={() => setShow(false)}
+          onPointerCancel={() => setShow(false)}
+          onKeyDown={(e) => {
+            if (e.key === ' ' || e.key === 'Enter') {
+              e.preventDefault()
+              setShow(true)
+            }
+          }}
+          onKeyUp={() => setShow(false)}
+          onBlur={() => setShow(false)}
         >
           {show ? <EyeOffIcon /> : <EyeIcon />}
         </button>

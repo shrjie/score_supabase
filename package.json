@@ -8,7 +8,9 @@
     "build": "vite build",
     "lint": "oxlint",
     "preview": "vite preview",
-    "bundle:sql": "node scripts/bundle-sql.mjs"
+    "bundle:sql": "node scripts/bundle-sql.mjs",
+    "deploy:gh": "node scripts/deploy-gh-pages.mjs",
+    "deploy:cf": "npm run build && npx --yes wrangler pages deploy dist --project-name score-query"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.58.0",

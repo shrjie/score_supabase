@@ -57,7 +57,7 @@ function classStatsTable(rows) {
 
 export default function StudentPage() {
   const { title } = useTitle()
-  const { me, session, signInStudent, signOut } = useAuth()
+  const { me, signInStudent, signOut } = useAuth()
   const [account, setAccount] = useState('')
   const [password, setPassword] = useState('')
   const [err, setErr] = useState('')
@@ -150,7 +150,10 @@ td.sub{text-align:left}td.fail{color:#c00;font-weight:900}td.pass{color:#1565c0;
     w.document.close()
   }
 
-  if (!session || !me?.success) {
+  const isStudent = !!me?.success && me.role === 'student' && !!me.student
+  const isTeacher = !!me?.success && me.role === 'teacher'
+
+  if (!isStudent) {
     return (
       <div className="app student">
         <header>
@@ -169,6 +172,12 @@ td.sub{text-align:left}td.fail{color:#c00;font-weight:900}td.pass{color:#1565c0;
         <main>
           <div className="glass card">
             <div className="card-title">學生登入</div>
+            {isTeacher && (
+              <div className="msg-error" style={{ background: '#e3f2fd', color: '#1565c0', borderColor: '#90caf9' }}>
+                你目前以老師身分登入。<Link to="/teacher">前往老師端</Link>　或　
+                <button className="btn-ghost" style={{ marginLeft: 4 }} onClick={signOut}>登出</button>
+              </div>
+            )}
             <div className="form-group">
               <label>帳號</label>
               <input value={account} onChange={(e) => setAccount(e.target.value)} placeholder="請輸入帳號" />

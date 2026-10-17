@@ -37,10 +37,11 @@ body {
 .form-group { margin-bottom: 18px; }
 /* 密碼欄的顯示／隱藏切換 */
 .pw-wrap { position: relative; display: inline-flex; align-items: center; width: 100%; }
-.pw-wrap > input { padding-right: 38px; }
-.pw-eye { position: absolute; right: 4px; top: 50%; transform: translateY(-50%); display: flex; align-items: center; justify-content: center; width: 30px; height: 30px; padding: 0; border: none; border-radius: 8px; background: transparent; color: #7c9a86; cursor: pointer; }
-.pw-eye:hover { background: rgba(102,187,106,.16); color: #2e7d32; }
-.pw-eye:focus-visible { outline: 2px solid var(--leaf); outline-offset: 1px; }
+.pw-wrap > input { padding-right: 66px; }
+.pw-btns { position: absolute; right: 4px; top: 50%; transform: translateY(-50%); display: flex; align-items: center; gap: 2px; }
+.pw-btn { display: flex; align-items: center; justify-content: center; width: 28px; height: 28px; padding: 0; border: none; border-radius: 8px; background: transparent; color: #7c9a86; cursor: pointer; }
+.pw-btn:hover { background: rgba(102,187,106,.16); color: #2e7d32; }
+.pw-btn:focus-visible { outline: 2px solid var(--leaf); outline-offset: 1px; }
 label { display: block; font-size: 13px; color: var(--text-mid); margin-bottom: 6px; }
 .student input, .student select { width: 100%; padding: 11px 15px; background: rgba(255,255,255,.65); border: 1.5px solid rgba(102,187,106,.4); border-radius: var(--radius-sm); font-size: 15px; font-family: inherit; outline: none; }
 .student input:focus, .student select:focus { border-color: var(--leaf); box-shadow: 0 0 0 3px rgba(102,187,106,.18); }

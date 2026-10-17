@@ -181,7 +181,7 @@ td.sub{text-align:left}td.fail{color:#c00;font-weight:900}td.pass{color:#1565c0;
             )}
             <div className="form-group">
               <label>帳號</label>
-              <input value={account} onChange={(e) => setAccount(e.target.value)} placeholder="請輸入帳號" />
+              <input value={account} onChange={(e) => setAccount(e.target.value)} placeholder="請輸入帳號" autoComplete="username" name="username" />
             </div>
             <div className="form-group">
               <label>密碼</label>

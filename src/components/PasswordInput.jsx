@@ -14,7 +14,17 @@ const EyeOffIcon = () => (
   </svg>
 )
 
-// 密碼輸入框（預設遮罩顯示，可切換明文／隱藏）
+const CloseIcon = () => (
+  <svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" aria-hidden="true">
+    <line x1="5" y1="5" x2="19" y2="19" />
+    <line x1="19" y1="5" x2="5" y2="19" />
+  </svg>
+)
+
+// 密碼輸入框
+// - 預設遮罩顯示，可切換明文／隱藏
+// - 聚焦時自動全選：即使瀏覽器自動填入舊密碼，直接打字即可取代，不需先刪除
+// - 有內容時顯示「清除」按鈕
 export default function PasswordInput({
   value,
   onChange,
@@ -24,8 +34,11 @@ export default function PasswordInput({
   style,
   className = '',
   label = '密碼',
+  selectOnFocus = true,
 }) {
   const [show, setShow] = useState(false)
+  const hasValue = value !== undefined && value !== null && value !== ''
+
   return (
     <span className="pw-wrap">
       <input
@@ -35,22 +48,41 @@ export default function PasswordInput({
         placeholder={placeholder}
         autoComplete={autoComplete || 'current-password'}
         style={style}
+        onFocus={(e) => {
+          if (selectOnFocus && e.target.value) e.target.select()
+        }}
         onChange={(e) => onChange?.(e.target.value)}
         onKeyDown={(e) => {
           if (e.key === 'Enter') onEnter?.()
         }}
       />
-      <button
-        type="button"
-        className="pw-eye"
-        onClick={() => setShow((v) => !v)}
-        title={show ? `隱藏${label}` : `顯示${label}`}
-        aria-label={show ? `隱藏${label}` : `顯示${label}`}
-        aria-pressed={show}
-        tabIndex={-1}
-      >
-        {show ? <EyeOffIcon /> : <EyeIcon />}
-      </button>
+      <span className="pw-btns">
+        {hasValue && (
+          <button
+            type="button"
+            className="pw-btn"
+            onClick={() => {
+              onChange?.('')
+            }}
+            title="清除"
+            aria-label={`清除${label}`}
+            tabIndex={-1}
+          >
+            <CloseIcon />
+          </button>
+        )}
+        <button
+          type="button"
+          className="pw-btn"
+          onClick={() => setShow((v) => !v)}
+          title={show ? `隱藏${label}` : `顯示${label}`}
+          aria-label={show ? `隱藏${label}` : `顯示${label}`}
+          aria-pressed={show}
+          tabIndex={-1}
+        >
+          {show ? <EyeOffIcon /> : <EyeIcon />}
+        </button>
+      </span>
     </span>
   )
 }

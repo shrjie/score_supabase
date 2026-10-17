@@ -1,0 +1,45 @@
+name: Keep Supabase alive + daily backup
+
+# 免費方案 Supabase 專案若連續 7 天低活動會被暫停（網站離線）。
+# 這個排程做兩件事：
+#   1. 每天打 API 產生活動，避免專案被暫停
+#   2. 每天把資料庫備份成檔案當成 Actions artifact（保留 30 天）
+on:
+  schedule:
+    # 每天兩次（UTC 03:10 / 15:10），避免剛好跨過暫停判定
+    - cron: '10 3 * * *'
+    - cron: '10 15 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  keep-alive:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Supabase
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+        run: |
+          curl -sS -o /dev/null -w "keep-alive HTTP %{http_code}\n" \
+            "$SUPABASE_URL/rest/v1/app_config?select=key" \
+            -H "apikey: $SUPABASE_ANON_KEY" \
+            -H "Authorization: Bearer $SUPABASE_ANON_KEY"
+
+  backup:
+    # 每週一次完整備份（完整備份檔較大，請勿提交到 git 公開儲存庫）
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: supabase/setup-gh@v1
+        with:
+          project-id: ${{ secrets.SUPABASE_PROJECT_ID }}
+          db-url: ${{ secrets.SUPABASE_DB_URL }}
+      - run: supabase db dump --db-url "$DB_URL" -f dump.sql
+      - uses: actions/upload-artifact@v4
+        with:
+          name: db-backup-$(date +%Y%m%d)
+          path: dump.sql
+          retention-days: 30

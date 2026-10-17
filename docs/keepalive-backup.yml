@@ -38,14 +38,19 @@ jobs:
     steps:
       - name: Install Supabase CLI
         run: npm install -g supabase
-      - name: Dump database
+      - name: Dump schema and data
         env:
           DB_URL: ${{ secrets.SUPABASE_DB_URL }}
-        run: supabase db dump --db-url "$DB_URL" -f dump.sql
-      - name: Show tables included
-        run: grep -c '^insert into' dump.sql || true
+        run: |
+          supabase db dump --db-url "$DB_URL" --schema-only -f schema.sql
+          supabase db dump --db-url "$DB_URL" --data-only --use-copy -f data.sql
+          echo "schema.sql: $(wc -c < schema.sql) bytes"
+          echo "data.sql:   $(wc -c < data.sql) bytes"
+          echo "insert 筆數: $(grep -ci 'insert into\|^\\\\\.' data.sql || true)"
       - uses: actions/upload-artifact@v4
         with:
           name: db-backup-${{ github.run_id }}
-          path: dump.sql
+          path: |
+            schema.sql
+            data.sql
           retention-days: 30

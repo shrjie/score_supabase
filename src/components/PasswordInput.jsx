@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 
 const EyeIcon = () => (
   <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -23,8 +23,10 @@ const CloseIcon = () => (
 
 // 密碼輸入框
 // - 預設遮罩顯示，可切換明文／隱藏
-// - 聚焦時自動全選：即使瀏覽器自動填入舊密碼，直接打字即可取代，不需先刪除
+// - 聚焦時自動全選：即使有殘留內容，直接打字即可取代
 // - 有內容時顯示「清除」按鈕
+// - clearOnMount：清掉瀏覽器自動填入的舊密碼（Chrome 自動填入不會觸發事件，
+//   因此載入後幾個時間點各檢查一次；若使用者尚未輸入就發現有值就清掉）
 export default function PasswordInput({
   value,
   onChange,
@@ -35,13 +37,32 @@ export default function PasswordInput({
   className = '',
   label = '密碼',
   selectOnFocus = true,
+  clearOnMount = true,
 }) {
   const [show, setShow] = useState(false)
+  const inputRef = useRef(null)
+  const touched = useRef(false)
   const hasValue = value !== undefined && value !== null && value !== ''
+
+  useEffect(() => {
+    if (!clearOnMount) return undefined
+    const timers = [0, 200, 600, 1200, 2000, 3000, 4000, 6000, 8000, 10000, 15000].map((ms) =>
+      setTimeout(() => {
+        const el = inputRef.current
+        if (el && el.value && !touched.current) {
+          el.value = ''
+          onChange?.('')
+        }
+      }, ms),
+    )
+    return () => timers.forEach(clearTimeout)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   return (
     <span className="pw-wrap">
       <input
+        ref={inputRef}
         className={className}
         type={show ? 'text' : 'password'}
         value={value}
@@ -49,9 +70,16 @@ export default function PasswordInput({
         autoComplete={autoComplete || 'current-password'}
         style={style}
         onFocus={(e) => {
+          touched.current = true
           if (selectOnFocus && e.target.value) e.target.select()
         }}
-        onChange={(e) => onChange?.(e.target.value)}
+        onClick={(e) => {
+          if (selectOnFocus && e.target.value) e.target.select()
+        }}
+        onChange={(e) => {
+          touched.current = true
+          onChange?.(e.target.value)
+        }}
         onKeyDown={(e) => {
           if (e.key === 'Enter') onEnter?.()
         }}
@@ -62,6 +90,7 @@ export default function PasswordInput({
             type="button"
             className="pw-btn"
             onClick={() => {
+              touched.current = true
               onChange?.('')
             }}
             title="清除"

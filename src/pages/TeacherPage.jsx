@@ -12,12 +12,14 @@ import ImportStudents from '../components/ImportStudents'
 import ImportScores from '../components/ImportScores'
 import StatsPanel from '../components/StatsPanel'
 import PasswordInput from '../components/PasswordInput'
+import ClassArchivePanel from '../components/ClassArchivePanel'
 
 const TABS = [
   ['grade', '成績編修'],
   ['exam', '考試科目'],
   ['stats', '統計圖表'],
   ['stu', '學生管理'],
+  ['cls', '班級封存'],
   ['audit', '操作紀錄'],
 ]
 
@@ -126,6 +128,7 @@ export default function TeacherPage() {
         {tab === 'exam' && <ExamPanel onModal={setModal} title={title} setTitle={setTitle} />}
         {tab === 'stats' && <StatsPanel />}
         {tab === 'stu' && <StudentPanel onModal={setModal} />}
+        {tab === 'cls' && <ClassArchivePanel />}
         {tab === 'audit' && <AuditPanel />}
       </main>
       <Modal state={modal} onClose={() => setModal(null)} />
@@ -578,12 +581,88 @@ function StudentPanel({ onModal }) {
   const [pwInput, setPwInput] = useState('')
   const [pwErr, setPwErr] = useState('')
   const [pwBusy, setPwBusy] = useState(false)
+  const [showAll, setShowAll] = useState(false)
+  const [accTarget, setAccTarget] = useState(null)
+  const [accNew, setAccNew] = useState('')
+  const [accPw, setAccPw] = useState('')
+  const [accErr, setAccErr] = useState('')
+  const [accBusy, setAccBusy] = useState(false)
+
+  function openAccount(s) {
+    setAccTarget(s)
+    setAccNew(s.account)
+    setAccPw('')
+    setAccErr('')
+  }
+
+  async function doChangeAccount() {
+    if (!accTarget) return
+    const next = accNew.trim()
+    if (!next) { setAccErr('新帳號不可空白'); return }
+    if (next === accTarget.account) { setAccErr('新舊帳號相同'); return }
+    setAccBusy(true)
+    const { data, error } = await supabase.functions.invoke('admin', {
+      body: {
+        action: 'change_account', old_account: accTarget.account, new_account: next,
+        password: accPw.trim(),
+      },
+    })
+    setAccBusy(false)
+    if (error || !data?.success) { setAccErr(error?.message || data?.message || '失敗'); return }
+    setInfo(`✅ ${accTarget.name} 的帳號已改為 ${next}`)
+    setAccTarget(null)
+    reload()
+  }
 
   const reload = useCallback(async () => {
-    const list = await rpc('api_teacher_students')
+    const list = await rpc('api_teacher_students', { p_include_graduated: showAll })
     setStudents(Array.isArray(list) ? list : [])
-  }, [])
+  }, [showAll])
   useEffect(() => { reload() }, [reload])
+
+  // 表格內編修：離開欄位自動儲存
+  async function saveField(s, field, value) {
+    const v = String(value ?? '').trim()
+    if (v === String(s[field] ?? '')) return
+    if (!v) { setInfo('❌ 欄位不可空白，已取消'); reload(); return }
+    if (field === 'account') {
+      const r = await supabase.functions.invoke('admin', {
+        body: { action: 'change_account', old_account: s.account, new_account: v },
+      })
+      if (r.error || !r.data?.success) {
+        setInfo('❌ ' + (r.error?.message || r.data?.message || '改帳號失敗'))
+        reload()
+        return
+      }
+      setInfo(`✅ ${s.name} 的帳號已改為 ${v}`)
+      reload()
+      return
+    }
+    const body = {
+      action: 'upsert_student', account: s.account,
+      password: '', seat: s.seat, name: s.name, class_no: s.class_no, excluded: s.excluded,
+    }
+    body[field] = v
+    const { data, error } = await supabase.functions.invoke('admin', { body })
+    if (error || !data?.success) {
+      setInfo('❌ ' + (error?.message || data?.message || '儲存失敗'))
+      reload()
+      return
+    }
+    setInfo(`✅ 已更新 ${s.name} 的${field === 'seat' ? '座號' : field === 'name' ? '姓名' : '班級'}：${v}`)
+    reload()
+  }
+
+  function removeStudent(s) {
+    if (!confirm(`確定刪除學生「${s.seat} ${s.name}（${s.account}）」？\n\n⚠ 其登入帳號會一併刪除，且所有成績紀錄將無法復原。`)) return
+    setInfo('刪除中…')
+    supabase.functions.invoke('admin', { body: { action: 'delete_student', account: s.account } })
+      .then(({ data, error }) => {
+        if (error || !data?.success) { setInfo('❌ ' + (error?.message || data?.message || '失敗')); return }
+        setInfo(`✅ 已刪除 ${s.name}`)
+        reload()
+      })
+  }
 
   async function upsert() {
     if (!form.account || !form.seat || !form.name) { setInfo('❌ 帳號/座號/姓名不可空白'); return }
@@ -631,6 +710,13 @@ function StudentPanel({ onModal }) {
       <h3>學生名單 <span className="hint">(測試帳不列入排名)</span></h3>
       <div className="row" style={{ marginTop: 8 }}>
         <div><label>&nbsp;</label><button className="btn-g" onClick={() => setImportOpen((v) => !v)}>匯入名冊(Excel/CSV)</button></div>
+        <div><label>顯示</label>
+          <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, marginLeft: 6 }}>
+            <input type="checkbox" checked={showAll} onChange={(e) => setShowAll(e.target.checked)} style={{ width: 18, height: 18 }} />
+            含已畢業學生
+          </label>
+        </div>
+        <span className="hint">座號／姓名／班級可直接點格子修改，離開自動儲存。</span>
       </div>
       {importOpen && (
         <div className="card dashed" style={{ marginTop: 12 }}>
@@ -642,15 +728,33 @@ function StudentPanel({ onModal }) {
         <thead><tr><th>座號</th><th>姓名</th><th>帳號</th><th>班級</th><th>狀態</th><th /></tr></thead>
         <tbody>
           {students.map((s) => (
-            <tr key={s.account}>
-              <td style={{ textAlign: 'center' }}>{s.seat}</td>
-              <td>{s.name}{s.excluded ? <span className="test-badge">測</span> : ''}</td>
-              <td>{s.account}</td>
-              <td>{s.class_no}</td>
-              <td>{s.excluded ? '測試(不排名)' : '正式'}</td>
+            <tr key={s.id} className={s.graduated ? 'grad-row' : ''}>
+              <td style={{ textAlign: 'center' }}>
+                <input className="cell-inline" defaultValue={s.seat} key={s.id + '_seat'}
+                  onBlur={(e) => saveField(s, 'seat', e.target.value)} />
+              </td>
               <td>
-                <button className="btn-g btn-s" onClick={() => toggleExcluded(s)}>{s.excluded ? '轉正式' : '設測試'}</button>{' '}
-                <button className="btn-g btn-s" onClick={() => resetPassword(s)}>重設密碼</button>
+                <input className="cell-inline" style={{ width: 120 }} defaultValue={s.name} key={s.id + '_name'}
+                  onBlur={(e) => saveField(s, 'name', e.target.value)} />
+                {s.excluded && <span className="test-badge">測</span>}
+                {s.graduated && <span className="grad-badge">畢</span>}
+              </td>
+              <td>
+                <input className="cell-inline" defaultValue={s.account} key={s.id + '_acc'}
+                  onBlur={(e) => saveField(s, 'account', e.target.value)} />
+              </td>
+              <td>
+                <input className="cell-inline" style={{ width: 80 }} defaultValue={s.class_no} key={s.id + '_cls'}
+                  onBlur={(e) => saveField(s, 'class_no', e.target.value)} />
+              </td>
+              <td>{s.graduated ? '已畢業' : s.excluded ? '測試(不排名)' : '正式'}</td>
+              <td style={{ whiteSpace: 'nowrap' }}>
+                {!s.graduated && (
+                  <button className="btn-g btn-s" onClick={() => toggleExcluded(s)}>{s.excluded ? '轉正式' : '設測試'}</button>
+                )}{' '}
+                <button className="btn-g btn-s" onClick={() => resetPassword(s)}>重設密碼</button>{' '}
+                <button className="btn-g btn-s" onClick={() => openAccount(s)}>改帳號</button>{' '}
+                <button className="btn-r btn-s" onClick={() => removeStudent(s)}>刪除</button>
               </td>
             </tr>
           ))}
@@ -667,6 +771,28 @@ function StudentPanel({ onModal }) {
         <div><label>&nbsp;</label><button className="btn-p" onClick={upsert}>儲存</button></div>
       </div>
       <div className="info">{info}</div>
+
+      {accTarget && (
+        <div className="modal-overlay show" onClick={(e) => e.target === e.currentTarget && setAccTarget(null)}>
+          <div className="modal-box ok">
+            <div className="modal-title">更改登入帳號</div>
+            <div className="modal-msg">{accTarget.seat} {accTarget.name}（成績會完整保留）</div>
+            <div style={{ margin: '12px 0' }}>
+              <label style={{ display: 'block', marginBottom: 4 }}>新帳號</label>
+              <input value={accNew} onChange={(e) => setAccNew(e.target.value)} style={{ width: '100%' }} />
+            </div>
+            <div style={{ marginBottom: 12 }}>
+              <label style={{ display: 'block', marginBottom: 4 }}>同時設定新密碼（留空＝不變）</label>
+              <PasswordInput value={accPw} onChange={setAccPw} autoComplete="new-password" placeholder="至少 6 碼，留空則不變" label="新密碼" style={{ width: '100%' }} />
+            </div>
+            {accErr && <div className="err-box show">{accErr}</div>}
+            <div style={{ marginTop: 12, display: 'flex', gap: 8, justifyContent: 'center' }}>
+              <button className="btn-primary" disabled={accBusy} onClick={doChangeAccount}>{accBusy ? '處理中…' : '確定更改'}</button>
+              <button className="btn-g" onClick={() => setAccTarget(null)}>取消</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {pwTarget && (
         <div className="modal-overlay show" onClick={(e) => e.target === e.currentTarget && setPwTarget(null)}>

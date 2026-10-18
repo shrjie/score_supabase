@@ -51,6 +51,12 @@ Deno.serve(async (req) => {
     if (action === 'reset_password') {
       return await resetPassword(admin, body)
     }
+    if (action === 'change_account') {
+      return await changeAccount(admin, body)
+    }
+    if (action === 'set_ban') {
+      return await setBan(admin, body)
+    }
     if (action === 'delete_student') {
       return await deleteStudent(admin, body)
     }
@@ -119,6 +125,62 @@ async function upsertStudent(admin: any, b: Record<string, unknown>) {
     detail: `帳號=${account}${password ? '（重設密碼）' : ''} 測試=${excluded ? 1 : 0}`,
   })
   return json({ success: true })
+}
+
+// 更改帳號：保留學生的所有成績，只換登入帳號與 Auth email
+async function changeAccount(admin: any, b: Record<string, unknown>) {
+  const oldAccount = String(b.old_account ?? '').trim()
+  const newAccount = String(b.new_account ?? '').trim()
+  const password = b.password ? String(b.password) : ''
+  if (!oldAccount || !newAccount) return json({ success: false, message: '新旧帳號不可空白' }, 400)
+  if (oldAccount === newAccount) return json({ success: false, message: '新舊帳號相同' }, 400)
+  if (password && password.length < 6) return json({ success: false, message: '新密碼至少 6 碼' }, 400)
+
+  const { data: dup } = await admin.from('students').select('id').eq('account', newAccount).maybeSingle()
+  if (dup) return json({ success: false, message: `帳號 ${newAccount} 已被使用` }, 400)
+
+  const { data: existing } = await admin.from('students').select('id, user_id').eq('account', oldAccount).maybeSingle()
+  if (!existing) return json({ success: false, message: '找不到學生' }, 404)
+
+  const { error: updErr } = await admin.from('students').update({ account: newAccount }).eq('id', existing.id)
+  if (updErr) return json({ success: false, message: updErr.message }, 400)
+
+  if (existing.user_id) {
+    const patch: Record<string, unknown> = { email: `${newAccount.toLowerCase()}@${STUDENT_EMAIL_DOMAIN}` }
+    if (password) patch.password = password
+    const { error } = await admin.auth.admin.updateUserById(existing.user_id, patch)
+    if (error) {
+      // 回復資料表帳號，避免不一致
+      await admin.from('students').update({ account: oldAccount }).eq('id', existing.id)
+      return json({ success: false, message: error.message }, 400)
+    }
+  }
+
+  await admin.from('audit_logs').insert({
+    actor: 'teacher', action: 'change_account', detail: `帳號 ${oldAccount} → ${newAccount}`,
+  })
+  return json({ success: true })
+}
+
+// 停用／啟用學生登入（畢業封存時停用）
+async function setBan(admin: any, b: Record<string, unknown>) {
+  const accounts = Array.isArray(b.accounts) ? b.accounts.map((x: unknown) => String(x).trim()).filter(Boolean) : []
+  const banned = b.banned !== false
+  if (!accounts.length) return json({ success: false, message: '未指定帳號' }, 400)
+  let ok = 0
+  const failed: string[] = []
+  for (const acc of accounts) {
+    const { data } = await admin.from('students').select('user_id').eq('account', acc).maybeSingle()
+    if (!data?.user_id) { failed.push(acc); continue }
+    const { error } = await admin.auth.admin.updateUserById(data.user_id, { ban_duration: banned ? '876000h' : 'none' })
+    if (error) failed.push(acc)
+    else ok++
+  }
+  await admin.from('audit_logs').insert({
+    actor: 'teacher', action: banned ? 'ban_students' : 'unban_students',
+    detail: `${banned ? '停用' : '啟用'} ${ok} 個帳號${failed.length ? `，失敗：${failed.join(',')}` : ''}`,
+  })
+  return json({ success: true, updated: ok, failed })
 }
 
 async function deleteStudent(admin: any, b: Record<string, unknown>) {

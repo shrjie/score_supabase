@@ -38,16 +38,29 @@ export async function parseTable(file) {
 export const cell = (v) => (v === null || v === undefined ? '' : String(v).trim())
 const normH = (v) => cell(v).replace(/[\s　]/g, '').toLowerCase()
 
+// 欄位別名：對應常見名單表頭（同時支援繁簡體與「序號」）
+//   學號 → 登入帳號、身分證字號 → 登入密碼（沿用原 GAS 版慣例）
 export const STUDENT_FIELDS = {
-  account: ['帳號', '账号', '帐号', '帳户', '賬號', 'account'],
-  password: ['密碼', '密码', 'password', 'passwd', 'pwd'],
-  seat: ['座號', '座号', '座次', 'seat'],
+  account: ['帳號', '账号', '帐号', '帳户', '賬號', '學號', '学号', '學生學號', '学生学号', 'account'],
+  password: [
+    '密碼', '密码', '身分證字號', '身份證字號', '身分證號碼', '身份證號碼',
+    '身分证字號', '身份证字号', '身分证号码', '身份证号码', '身分證', '身份證', '身分证', '身份证',
+    'password', 'passwd', 'pwd',
+  ],
+  seat: ['座號', '座号', '座次', '序號', '序号', '序位', 'seat', 'no'],
   name: ['姓名', 'name'],
-  class_no: ['班級', '班级', '班别', 'class'],
+  class_no: ['班級', '班级', '班别', '班級代號', 'class'],
   excluded: ['測試', '测试', '排除', '不排名', 'test', 'exclude'],
 }
 
 function detectCol(header, keys) {
+  // 先找完全相符，避免 'no' 這類短字誤判到其他欄位
+  for (const k of keys) {
+    for (let i = 0; i < header.length; i++) {
+      if (normH(header[i]) === k) return i
+    }
+  }
+  // 再用包含比對
   for (let i = 0; i < header.length; i++) {
     const h = normH(header[i])
     if (h && keys.some((k) => h.includes(k))) return i

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { rpc, supabase } from '../lib/supabase'
+import ImportStudents from './ImportStudents'
 
 function fmtTime(v) {
   if (!v) return '—'
@@ -72,7 +73,7 @@ function ArchiveDialog({ currentClass, onClose, onDone }) {
             </div>
           </div>
           <div style={{ marginTop: 14, display: 'flex', gap: 8, justifyContent: 'center', flexWrap: 'wrap' }}>
-            <button className="btn-p" onClick={() => { onDone?.(); onClose() }}>開始匯入新班級</button>
+            <button className="btn-p" onClick={() => { onDone?.(result.newClass); onClose() }}>匯入新班級學生</button>
             <button className="btn-r" onClick={() => { onDone?.(result.id); onClose() }}>取消封存（還原）</button>
           </div>
         </div>
@@ -167,6 +168,8 @@ export default function ClassArchivePanel() {
   const [openId, setOpenId] = useState('')
   const [dialog, setDialog] = useState(false)
   const [restoreId, setRestoreId] = useState('')
+  const [importOpen, setImportOpen] = useState(false)
+  const [importClass, setImportClass] = useState('')
 
   const load = useCallback(async () => {
     const [c, a] = await Promise.all([rpc('api_class_current'), rpc('api_archives', { p_with_students: true })])
@@ -228,10 +231,30 @@ export default function ClassArchivePanel() {
       </div>
       <div className="info">{info}</div>
 
-      {dialog && <ArchiveDialog currentClass={current} onClose={() => setDialog(false)} onDone={(restoreId) => {
+      {dialog && <ArchiveDialog currentClass={current} onClose={() => setDialog(false)} onDone={(arg) => {
         load()
-        if (restoreId) { setInfo('ℹ️ 可在下方按「取消封存」還原'); doRestore(restoreId) }
+        if (typeof arg === 'string' && arg.length === 36) {
+          setInfo('ℹ️ 可在下方按「取消封存」還原'); doRestore(arg)
+        } else if (typeof arg === 'string' && arg) {
+          setImportClass(arg); setImportOpen(true)
+        }
       }} />}
+
+      <h3 style={{ marginTop: 20 }}>
+        新班級學生名冊匯入
+        <button className="btn-g btn-s" style={{ float: 'right' }} onClick={() => setImportOpen((v) => !v)}>
+          {importOpen ? '收合' : '展開匯入'}
+        </button>
+      </h3>
+      <p className="hint">
+        封存並開新班級後，把新班級的名冊（座號、姓名、學號、身分證字號）用 Excel／CSV 匯入即可建立全部學生帳號，
+        不必一筆一筆輸入。
+      </p>
+      {importOpen && (
+        <div className="card dashed">
+          <ImportStudents defaultClass={importClass || newClass || current} onDone={load} />
+        </div>
+      )}
 
       <h3 style={{ marginTop: 20 }}>歷屆畢業班（{archives.length}）</h3>
       {!archives.length && <p className="hint">尚未有封存紀錄。</p>}

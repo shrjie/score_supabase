@@ -138,3 +138,8 @@ table.sub input.cell-inline:hover { border-color: #cfe6d4; background: #fff; }
 table.sub input.cell-inline:focus { border-color: var(--leaf); background: #fff; outline: none; box-shadow: 0 0 0 3px rgba(102,187,106,.18); }
 .grad-badge { display: inline-block; background: #5c6bc0; color: #fff; font-size: 10px; font-weight: 900; border-radius: 6px; padding: 1px 5px; margin-left: 4px; }
 table.sub tr.grad-row td { background: #eef0f8; color: #6b7280; }
+
+/* 封存防呆：風險提示框 */
+.warn-box { background: #fff8e1; border: 1.5px solid #ffb74d; border-radius: 8px; padding: 10px 12px; font-size: 13px; color: #8a4b00; line-height: 1.7; }
+.teacher .modal-box { text-align: left; }
+.teacher .modal-box .modal-title { text-align: center; }
